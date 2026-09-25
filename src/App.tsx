@@ -243,13 +243,13 @@ export function App() {
     setDirty(false);
     setPendingPassword(null);
     setPasswordValue("");
-    setStatus(`Loaded ${opened.pageInfos.length} page${opened.pageInfos.length === 1 ? "" : "s"} locally. No document copy was uploaded or stored by the app.`);
+    setStatus(`Loaded ${file.name} — ${opened.pageInfos.length} page${opened.pageInfos.length === 1 ? "" : "s"} locally. No document copy was uploaded or stored by the app.`);
   }, []);
 
   const openBytes = useCallback(
     async (file: File, bytes: Uint8Array, password?: string) => {
       setBusy(true);
-      setStatus("Opening PDF locally…");
+      setStatus(`Opening ${file.name} locally…`);
       await new Promise<void>((resolve) => window.setTimeout(resolve, 30));
       try {
         const { PdfEngine: PdfEngineRuntime } = await import("./pdf/engine");
@@ -279,9 +279,10 @@ export function App() {
             message: error.message,
           });
           setPasswordValue("");
-          setStatus("Password required.");
+          setStatus(`Password required for ${file.name}.`);
         } else {
-          setStatus(error instanceof Error ? error.message : String(error));
+          const message = error instanceof Error ? error.message : String(error);
+          setStatus(`Could not open ${file.name}: ${message}${engineRef.current ? " The previous PDF is still open." : ""}`);
         }
       } finally {
         setBusy(false);
@@ -302,14 +303,15 @@ export function App() {
         return;
       }
       setBusy(true);
-      setStatus("Reading PDF locally…");
+      setStatus(`Reading ${file.name} locally…`);
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
         const header = new TextDecoder("latin1").decode(bytes.slice(0, 1024));
         if (!header.includes("%PDF-")) throw new Error("This file does not have a valid PDF header.");
         await openBytes(file, bytes);
       } catch (error) {
-        setStatus(error instanceof Error ? error.message : String(error));
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(`Could not open ${file.name}: ${message}${engineRef.current ? " The previous PDF is still open." : ""}`);
       } finally {
         setBusy(false);
       }
@@ -694,6 +696,11 @@ export function App() {
 
       {engine && currentPage && currentEdit ? (
         <main className="workspace">
+          <div className="mobile-document-summary" aria-live="polite" title={fileName}>
+            <FileText size={14} aria-hidden="true" />
+            <strong>{fileName}</strong>
+            <span>{pages.length} page{pages.length === 1 ? "" : "s"}</span>
+          </div>
           <PageRail
             engine={engine}
             pages={pages}

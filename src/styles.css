@@ -321,6 +321,10 @@ code {
   overflow: hidden;
 }
 
+.mobile-document-summary {
+  display: none;
+}
+
 .page-rail {
   min-height: 0;
   display: flex;
@@ -1260,6 +1264,39 @@ code {
   .workspace {
     display: block;
     overflow: visible;
+  }
+
+  .mobile-document-summary {
+    min-width: 0;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .mobile-document-summary svg {
+    flex: 0 0 auto;
+    color: var(--accent);
+  }
+
+  .mobile-document-summary strong {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    color: var(--text);
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-document-summary span {
+    flex: 0 0 auto;
+    white-space: nowrap;
   }
 
   .viewer {
