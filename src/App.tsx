@@ -38,6 +38,36 @@ import { Inspector } from "./components/Inspector";
 import { PageRail } from "./components/PageRail";
 import { PdfViewport } from "./components/PdfViewport";
 
+type PdfEngineModule = typeof import("./pdf/engine");
+
+interface NetworkInformationLike {
+  effectiveType?: string;
+  saveData?: boolean;
+}
+
+let pdfEngineModulePromise: Promise<PdfEngineModule> | null = null;
+
+function loadPdfEngine(): Promise<PdfEngineModule> {
+  if (pdfEngineModulePromise === null) {
+    pdfEngineModulePromise = import("./pdf/engine").catch((error: unknown) => {
+      pdfEngineModulePromise = null;
+      throw error;
+    });
+  }
+  return pdfEngineModulePromise;
+}
+
+function warmPdfEngine(): void {
+  void loadPdfEngine().catch(() => {
+    // Opening a PDF will retry and surface a useful error if warm-up failed.
+  });
+}
+
+function shouldWarmPdfEngineOnIdle(): boolean {
+  const connection = (navigator as Navigator & { connection?: NetworkInformationLike }).connection;
+  return connection?.saveData !== true && connection?.effectiveType === "4g";
+}
+
 interface PendingPassword {
   file: File;
   bytes: Uint8Array;
@@ -175,6 +205,22 @@ export function App() {
     engineRef.current = engine;
   }, [engine]);
 
+  useEffect(() => {
+    if (!shouldWarmPdfEngineOnIdle()) return;
+
+    const idleWindow = window as Window & typeof globalThis & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    const idleHandle = idleWindow.requestIdleCallback?.(warmPdfEngine, { timeout: 3_000 });
+    if (idleHandle !== undefined) {
+      return () => idleWindow.cancelIdleCallback?.(idleHandle);
+    }
+
+    const timeoutHandle = window.setTimeout(warmPdfEngine, 1_500);
+    return () => window.clearTimeout(timeoutHandle);
+  }, []);
+
   useEffect(
     () => () => {
       engineRef.current?.close();
@@ -252,7 +298,7 @@ export function App() {
       setStatus(`Opening ${file.name} locally…`);
       await new Promise<void>((resolve) => window.setTimeout(resolve, 30));
       try {
-        const { PdfEngine: PdfEngineRuntime } = await import("./pdf/engine");
+        const { PdfEngine: PdfEngineRuntime } = await loadPdfEngine();
         const opened = await PdfEngineRuntime.open(bytes, password);
         if (!opened.canEdit) {
           opened.close();
@@ -302,6 +348,7 @@ export function App() {
         setStatus("Choose a PDF file.");
         return;
       }
+      warmPdfEngine();
       setBusy(true);
       setStatus(`Reading ${file.name} locally…`);
       try {
@@ -324,6 +371,7 @@ export function App() {
       setStatus("Wait for the current PDF operation to finish.");
       return;
     }
+    warmPdfEngine();
     fileInputRef.current?.click();
   }, [busy]);
 
@@ -601,6 +649,7 @@ export function App() {
       className={`app ${dragActive ? "is-dragging-file" : ""}`}
       onDragEnter={(event) => {
         event.preventDefault();
+        warmPdfEngine();
         if (!busy) setDragActive(true);
       }}
       onDragOver={(event) => event.preventDefault()}
@@ -646,6 +695,9 @@ export function App() {
           type="button"
           className="open-button"
           aria-label={engine ? "Open another PDF" : "Open PDF"}
+          onPointerEnter={warmPdfEngine}
+          onFocus={warmPdfEngine}
+          onTouchStart={warmPdfEngine}
           onClick={chooseFile}
           disabled={busy}
         >
@@ -765,7 +817,15 @@ export function App() {
             <span className="eyebrow">No uploads. No account.</span>
             <h1>Crop and rotate PDFs,<br />privately in your browser.</h1>
             <p>Crop, rotate, auto-trim, and batch-edit PDFs locally with a live preview. No file upload, account, or server-side document storage.</p>
-            <button type="button" className="primary-hero-button" onClick={chooseFile} disabled={busy}>
+            <button
+              type="button"
+              className="primary-hero-button"
+              onPointerEnter={warmPdfEngine}
+              onFocus={warmPdfEngine}
+              onTouchStart={warmPdfEngine}
+              onClick={chooseFile}
+              disabled={busy}
+            >
               <FolderOpen size={19} /> Select a PDF
             </button>
             <span className="drop-hint">or drop a PDF anywhere</span>
