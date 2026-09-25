@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">CropRotate PDF</title>
+  <desc id="desc">Crop and rotate PDFs privately, with no document upload or server storage.</desc>
+  <defs>
+    <linearGradient id="bg" x1="76" y1="38" x2="1124" y2="592" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#142326"/>
+      <stop offset="1" stop-color="#080c0e"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="778" y1="120" x2="1064" y2="500" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#75f2df"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <filter id="shadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#000000" flood-opacity="0.42"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="630" rx="30" fill="url(#bg)"/>
+  <circle cx="1098" cy="72" r="246" fill="#5eead4" opacity="0.055"/>
+  <circle cx="1128" cy="626" r="310" fill="#2dd4bf" opacity="0.04"/>
+
+  <g transform="translate(72 70)">
+    <rect width="58" height="58" rx="15" fill="#5eead4"/>
+    <path d="M17 11h17l9 9v27H17a5 5 0 0 1-5-5V16a5 5 0 0 1 5-5Z" fill="#0b2421"/>
+    <path d="M34 11v9h9" fill="none" stroke="#95fff0" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M20 29v-4h4M34 25h4v4M38 37v4h-4M24 41h-4v-4" fill="none" stroke="#5eead4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="78" y="39" fill="#f3f7f5" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="29" font-weight="800" letter-spacing="1.2">CROPROTATE PDF</text>
+  </g>
+
+  <text x="72" y="244" fill="#f3f7f5" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="72" font-weight="800" letter-spacing="-3.4">
+    <tspan x="72" dy="0">Crop &amp; rotate PDFs</tspan>
+    <tspan x="72" dy="82">privately.</tspan>
+  </text>
+  <text x="72" y="441" fill="#9fb1ae" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="26" font-weight="500">Precision edits, entirely in your browser.</text>
+
+  <g transform="translate(72 496)" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="19" font-weight="700">
+    <rect width="159" height="52" rx="26" fill="#152b2b" stroke="#2d5653"/>
+    <circle cx="27" cy="26" r="7" fill="#5eead4"/>
+    <text x="45" y="33" fill="#d8e6e3">No uploads</text>
+    <rect x="173" width="210" height="52" rx="26" fill="#152b2b" stroke="#2d5653"/>
+    <circle cx="200" cy="26" r="7" fill="#5eead4"/>
+    <text x="218" y="33" fill="#d8e6e3">No server storage</text>
+    <rect x="397" width="159" height="52" rx="26" fill="#152b2b" stroke="#2d5653"/>
+    <circle cx="424" cy="26" r="7" fill="#5eead4"/>
+    <text x="442" y="33" fill="#d8e6e3">No account</text>
+  </g>
+
+  <g transform="translate(808 127) rotate(4 128 182)" filter="url(#shadow)">
+    <path d="M26 0h166l64 64v282c0 11-9 20-20 20H26c-14 0-26-12-26-26V26C0 12 12 0 26 0Z" fill="url(#paper)"/>
+    <path d="M192 0v64h64" fill="#b8fff5" opacity="0.72"/>
+    <path d="M55 119v-31h31M170 88h31v31M201 247v31h-31M86 278H55v-31" fill="none" stroke="#063a33" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M82 184h94" stroke="#087f72" stroke-width="13" stroke-linecap="round" opacity="0.64"/>
+  </g>
+</svg>
