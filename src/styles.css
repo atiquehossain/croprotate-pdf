@@ -1267,6 +1267,9 @@ code {
   }
 
   .mobile-document-summary {
+    position: sticky;
+    top: 68px;
+    z-index: 9;
     min-width: 0;
     height: 36px;
     display: flex;
@@ -1339,14 +1342,14 @@ code {
 
   .inspector-heading {
     position: sticky;
-    top: 68px;
+    top: 104px;
     z-index: 8;
     background: var(--panel);
   }
 
   .inspector-tabs {
     position: sticky;
-    top: 136px;
+    top: 172px;
     z-index: 8;
     background: var(--panel);
   }
