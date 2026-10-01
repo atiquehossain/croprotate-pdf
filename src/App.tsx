@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
   FileText,
+  Files,
   FolderOpen,
   Github,
   Redo2,
@@ -36,6 +37,7 @@ import {
 } from "./pdf/geometry";
 import { Inspector } from "./components/Inspector";
 import { PageRail } from "./components/PageRail";
+import { PageOrganizer } from "./components/PageOrganizer";
 import { PdfViewport } from "./components/PdfViewport";
 
 type PdfEngineModule = typeof import("./pdf/engine");
@@ -46,6 +48,8 @@ interface NetworkInformationLike {
 }
 
 let pdfEngineModulePromise: Promise<PdfEngineModule> | null = null;
+const MAX_INPUT_FILE_BYTES = 75 * 1024 * 1024;
+const MAX_WORKING_INPUT_BYTES = 100 * 1024 * 1024;
 
 function loadPdfEngine(): Promise<PdfEngineModule> {
   if (pdfEngineModulePromise === null) {
@@ -73,6 +77,53 @@ interface PendingPassword {
   bytes: Uint8Array;
   message: string;
   ownerRequired: boolean;
+  purpose: "open" | "append";
+}
+
+let fallbackPageId = 0;
+
+function createPageId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  fallbackPageId += 1;
+  return `page-${Date.now()}-${fallbackPageId}`;
+}
+
+function createPageIds(count: number): string[] {
+  return Array.from({ length: count }, createPageId);
+}
+
+function combinedFileName(fileName: string): string {
+  const baseName = fileName.replace(/\.pdf$/i, "").replace(/-combined$/i, "") || "document";
+  return `${baseName}-combined.pdf`;
+}
+
+async function readPdfFile(file: File): Promise<Uint8Array<ArrayBuffer>> {
+  if (!file.name.toLowerCase().endsWith(".pdf") && file.type !== "application/pdf") {
+    throw new Error(`${file.name} is not a PDF file.`);
+  }
+  if (file.size > MAX_INPUT_FILE_BYTES) {
+    throw new Error(`${file.name} exceeds the 75 MB per-file safety limit.`);
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const header = new TextDecoder("latin1").decode(bytes.slice(0, 1024));
+  if (!header.includes("%PDF-")) {
+    throw new Error(`${file.name} does not have a valid PDF header.`);
+  }
+  return bytes;
+}
+
+function downloadPdfBytes(bytes: Uint8Array<ArrayBuffer>, fileName: string): void {
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function cloneEdits(edits: PageEdit[]): PageEdit[] {
@@ -123,7 +174,11 @@ function handleDialogKeyDown(
       "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex='-1'])",
     ),
   ).filter((element) => element.offsetParent !== null);
-  if (!focusable.length) return;
+  if (!focusable.length) {
+    event.preventDefault();
+    event.currentTarget.focus();
+    return;
+  }
   const first = focusable[0];
   const last = focusable[focusable.length - 1];
   if (event.shiftKey && document.activeElement === first) {
@@ -137,15 +192,20 @@ function handleDialogKeyDown(
 
 export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const addFileInputRef = useRef<HTMLInputElement>(null);
   const engineRef = useRef<PdfEngine | null>(null);
   const brandButtonRef = useRef<HTMLButtonElement>(null);
   const openButtonRef = useRef<HTMLButtonElement>(null);
+  const organizerButtonRef = useRef<HTMLButtonElement>(null);
+  const organizerAddButtonRef = useRef<HTMLButtonElement>(null);
   const privacyButtonRef = useRef<HTMLButtonElement>(null);
   const privacyReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const [engine, setEngine] = useState<PdfEngine | null>(null);
   const [fileName, setFileName] = useState("");
   const [fileSize, setFileSize] = useState(0);
   const [edits, setEdits] = useState<PageEdit[]>([]);
+  const [pageIds, setPageIds] = useState<string[]>([]);
+  const [selectedPageIds, setSelectedPageIds] = useState<string[]>([]);
   const [undoStack, setUndoStack] = useState<PageEdit[][]>([]);
   const [redoStack, setRedoStack] = useState<PageEdit[][]>([]);
   const [pageIndex, setPageIndex] = useState(0);
@@ -160,10 +220,12 @@ export function App() {
   const [passwordValue, setPasswordValue] = useState("");
   const [showAbout, setShowAbout] = useState(false);
   const [showPrivacy, setShowPrivacy] = useState(false);
+  const [showOrganizer, setShowOrganizer] = useState(false);
 
   const pages = engine?.pageInfos ?? [];
   const currentPage = pages[pageIndex];
   const currentEdit = edits[pageIndex];
+  const selectedPageIdSet = useMemo(() => new Set(selectedPageIds), [selectedPageIds]);
   const sourceUrl = useMemo(inferSourceUrl, []);
   const privacyUrl = `${import.meta.env.BASE_URL}privacy.html`;
   const licenseUrl = useMemo(
@@ -172,15 +234,18 @@ export function App() {
       : `${sourceUrl.replace(/\/$/, "")}/blob/main/LICENSE`,
     [sourceUrl],
   );
-  const modalOpen = pendingPassword !== null || showAbout || showPrivacy;
+  const modalOpen = pendingPassword !== null || showAbout || showPrivacy || showOrganizer;
 
   const closePassword = useCallback(() => {
     if (busy) return;
     setPendingPassword(null);
     setPasswordValue("");
     setStatus(engine ? "Kept the current PDF open." : "Open a PDF to begin.");
-    window.requestAnimationFrame(() => openButtonRef.current?.focus());
-  }, [busy, engine]);
+    window.requestAnimationFrame(() => {
+      if (showOrganizer) organizerAddButtonRef.current?.focus();
+      else openButtonRef.current?.focus();
+    });
+  }, [busy, engine, showOrganizer]);
 
   const closeAbout = useCallback(() => {
     setShowAbout(false);
@@ -200,6 +265,19 @@ export function App() {
       else privacyButtonRef.current?.focus();
     });
   }, []);
+
+  const openOrganizer = useCallback(() => {
+    if (!engine || busy) return;
+    setSelectedPageIds([]);
+    setShowOrganizer(true);
+  }, [busy, engine]);
+
+  const closeOrganizer = useCallback(() => {
+    if (busy) return;
+    setSelectedPageIds([]);
+    setShowOrganizer(false);
+    window.requestAnimationFrame(() => organizerButtonRef.current?.focus());
+  }, [busy]);
 
   useEffect(() => {
     engineRef.current = engine;
@@ -280,6 +358,8 @@ export function App() {
     setFileName(file.name);
     setFileSize(file.size);
     setEdits(opened.pageInfos.map(() => ({ rotation: 0, crop: null })));
+    setPageIds(createPageIds(opened.pageInfos.length));
+    setSelectedPageIds([]);
     setUndoStack([]);
     setRedoStack([]);
     setPageIndex(0);
@@ -292,24 +372,54 @@ export function App() {
     setStatus(`Loaded ${file.name} — ${opened.pageInfos.length} page${opened.pageInfos.length === 1 ? "" : "s"} locally. No document copy was uploaded or stored by the app.`);
   }, []);
 
+  const installMergedDocument = useCallback((
+    opened: PdfEngine,
+    addedFiles: readonly File[],
+    addedPageCount: number,
+    addedEncryptedPdf: boolean,
+  ) => {
+    const previous = engineRef.current;
+    setEngine(opened);
+    engineRef.current = opened;
+    previous?.close();
+    setEdits([
+      ...cloneEdits(edits),
+      ...Array.from({ length: addedPageCount }, () => ({ rotation: 0 as Rotation, crop: null })),
+    ]);
+    setPageIds([...pageIds, ...createPageIds(addedPageCount)]);
+    setUndoStack([]);
+    setRedoStack([]);
+    setFileName(combinedFileName(fileName));
+    setFileSize(opened.byteLength);
+    setDirty(true);
+    setPendingPassword(null);
+    setPasswordValue("");
+    const fileCount = addedFiles.length;
+    const encryptionNote = addedEncryptedPdf
+      ? " The combined copy uses the first PDF's password settings."
+      : "";
+    setStatus(`Added ${addedPageCount} page${addedPageCount === 1 ? "" : "s"} from ${fileCount} PDF${fileCount === 1 ? "" : "s"} locally. Existing page edits were kept, edit history was reset, and nothing was uploaded.${encryptionNote}`);
+  }, [edits, fileName, pageIds]);
+
   const openBytes = useCallback(
-    async (file: File, bytes: Uint8Array, password?: string) => {
+    async (file: File, bytes: Uint8Array, password?: string, ownerPasswordAttempt = false) => {
       setBusy(true);
       setStatus(`Opening ${file.name} locally…`);
       await new Promise<void>((resolve) => window.setTimeout(resolve, 30));
       try {
         const { PdfEngine: PdfEngineRuntime } = await loadPdfEngine();
         const opened = await PdfEngineRuntime.open(bytes, password);
-        if (!opened.canEdit) {
+        if (!opened.canEdit || !opened.canAssemble || !opened.canCopy) {
           opened.close();
           setPendingPassword({
             file,
             bytes,
             ownerRequired: true,
-            message: "That password opens the PDF for viewing, but editing is restricted. Enter the owner password.",
+            purpose: "open",
+            message: "That password opens the PDF, but editing, copying, or page assembly is restricted. Enter the owner password to use all tools.",
           });
           setPasswordValue("");
-          setStatus("The owner password is required to edit this PDF.");
+          setStatus("The owner password is required to use all editing and organizer tools.");
           return;
         }
         installDocument(opened, file);
@@ -321,11 +431,12 @@ export function App() {
           setPendingPassword({
             file,
             bytes,
-            ownerRequired: false,
-            message: error.message,
+            ownerRequired: ownerPasswordAttempt,
+            purpose: "open",
+            message: ownerPasswordAttempt ? "That owner password did not unlock all editing permissions." : error.message,
           });
           setPasswordValue("");
-          setStatus(`Password required for ${file.name}.`);
+          setStatus(ownerPasswordAttempt ? `The owner password is still required for ${file.name}.` : `Password required for ${file.name}.`);
         } else {
           const message = error instanceof Error ? error.message : String(error);
           setStatus(`Could not open ${file.name}: ${message}${engineRef.current ? " The previous PDF is still open." : ""}`);
@@ -344,17 +455,11 @@ export function App() {
         return;
       }
       if (dirty && !window.confirm("Edits are not auto-saved. Open another PDF and discard the current unsaved edits?")) return;
-      if (!file.name.toLowerCase().endsWith(".pdf") && file.type !== "application/pdf") {
-        setStatus("Choose a PDF file.");
-        return;
-      }
       warmPdfEngine();
       setBusy(true);
       setStatus(`Reading ${file.name} locally…`);
       try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const header = new TextDecoder("latin1").decode(bytes.slice(0, 1024));
-        if (!header.includes("%PDF-")) throw new Error("This file does not have a valid PDF header.");
+        const bytes = await readPdfFile(file);
         await openBytes(file, bytes);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -373,6 +478,147 @@ export function App() {
     }
     warmPdfEngine();
     fileInputRef.current?.click();
+  }, [busy]);
+
+  const appendBytes = useCallback(
+    async (file: File, bytes: Uint8Array, password?: string, ownerPasswordAttempt = false) => {
+      const current = engineRef.current;
+      if (!current) return;
+      setBusy(true);
+      setStatus(`Adding ${file.name} locally…`);
+      let imported: PdfEngine | null = null;
+      try {
+        const { PdfEngine: PdfEngineRuntime } = await loadPdfEngine();
+        imported = await PdfEngineRuntime.open(bytes, password);
+        if (!imported.canCopy) {
+          imported.close();
+          imported = null;
+          setPendingPassword({
+            file,
+            bytes,
+            ownerRequired: true,
+            purpose: "append",
+            message: "That password opens the PDF, but copying its pages is restricted. Enter the owner password to add it.",
+          });
+          setPasswordValue("");
+          setStatus(`The owner password is required to add ${file.name}.`);
+          return;
+        }
+        if (
+          (imported.encrypted && !current.encrypted) ||
+          (imported.requiresPassword && !current.requiresPassword)
+        ) {
+          setPendingPassword(null);
+          setPasswordValue("");
+          setStatus(`Could not add ${file.name}: the first PDF's settings would remove its encryption or required open password. Open the protected PDF first, then add other PDFs to it. The current PDF is unchanged.`);
+          window.requestAnimationFrame(() => organizerAddButtonRef.current?.focus());
+          return;
+        }
+        const addedPageCount = imported.pageInfos.length;
+        const importedEncrypted = imported.encrypted;
+        const combined = await current.append([imported]);
+        installMergedDocument(combined, [file], addedPageCount, importedEncrypted);
+        if (password !== undefined) {
+          window.requestAnimationFrame(() => organizerAddButtonRef.current?.focus());
+        }
+      } catch (error) {
+        if (error instanceof Error && error.name === "PasswordRequiredError") {
+          setPendingPassword({
+            file,
+            bytes,
+            ownerRequired: ownerPasswordAttempt,
+            purpose: "append",
+            message: ownerPasswordAttempt ? "That owner password did not allow copying these pages." : error.message,
+          });
+          setPasswordValue("");
+          setStatus(ownerPasswordAttempt ? `The owner password is still required to add ${file.name}.` : `Password required to add ${file.name}.`);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          setStatus(`Could not add ${file.name}: ${message} The current PDF is unchanged.`);
+        }
+      } finally {
+        imported?.close();
+        setBusy(false);
+      }
+    },
+    [installMergedDocument],
+  );
+
+  const acceptAddedFiles = useCallback(
+    async (files: readonly File[]) => {
+      const current = engineRef.current;
+      if (!current || !files.length) return;
+      if (busy) {
+        setStatus("Wait for the current PDF operation to finish.");
+        return;
+      }
+      const selectedBytes = files.reduce((total, file) => total + file.size, 0);
+      if (current.byteLength + selectedBytes > MAX_WORKING_INPUT_BYTES) {
+        setStatus("Could not add the selected PDFs: the working set would exceed the 100 MB in-memory safety limit. Add fewer or smaller files. The current PDF is unchanged.");
+        return;
+      }
+      warmPdfEngine();
+      setBusy(true);
+      setStatus(`Reading ${files.length} PDF${files.length === 1 ? "" : "s"} locally…`);
+      if (files.length === 1) {
+        try {
+          const bytes = await readPdfFile(files[0]);
+          await appendBytes(files[0], bytes);
+        } catch (error) {
+          setStatus(`Could not add ${files[0].name}: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
+        } finally {
+          setBusy(false);
+        }
+        return;
+      }
+
+      const imported: PdfEngine[] = [];
+      try {
+        const { PdfEngine: PdfEngineRuntime } = await loadPdfEngine();
+        for (const file of files) {
+          const bytes = await readPdfFile(file);
+          try {
+            const opened = await PdfEngineRuntime.open(bytes);
+            if (!opened.canCopy) {
+              opened.close();
+              throw new Error(`${file.name} does not allow content copying. Add it by itself and enter the owner password.`);
+            }
+            imported.push(opened);
+          } catch (error) {
+            if (error instanceof Error && error.name === "PasswordRequiredError") {
+              throw new Error(`${file.name} needs a password. Add password-protected PDFs one at a time.`);
+            }
+            throw error;
+          }
+        }
+        if (imported.some((item) =>
+          (item.encrypted && !current.encrypted) ||
+          (item.requiresPassword && !current.requiresPassword)
+        )) {
+          throw new Error("The first PDF's settings would remove another PDF's encryption or required open password. Open the protected PDF first, then add the other PDFs to it.");
+        }
+        const addedPageCount = imported.reduce((total, item) => total + item.pageInfos.length, 0);
+        const combined = await current.append(imported);
+        installMergedDocument(
+          combined,
+          files,
+          addedPageCount,
+          imported.some((item) => item.encrypted),
+        );
+      } catch (error) {
+        setStatus(`Could not add the selected PDFs: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
+      } finally {
+        imported.forEach((item) => item.close());
+        setBusy(false);
+      }
+    },
+    [appendBytes, busy, installMergedDocument],
+  );
+
+  const chooseAddedFiles = useCallback(() => {
+    if (busy || !engineRef.current) return;
+    warmPdfEngine();
+    addFileInputRef.current?.click();
   }, [busy]);
 
   const cropCurrentPage = useCallback(
@@ -566,24 +812,131 @@ export function App() {
     [busy, commitEdits, currentEdit, currentPage, edits, engine, pages],
   );
 
+  const applyPageOrder = useCallback(
+    async (
+      pageOrder: number[],
+      nextActivePageId: string,
+      nextSelection: string[],
+      message: string,
+    ) => {
+      const current = engineRef.current;
+      if (!current || busy) return;
+      setBusy(true);
+      setStatus("Rebuilding the page order locally…");
+      try {
+        const reordered = await current.reorganize(pageOrder);
+        const nextEdits = pageOrder.map((index) => cloneEdits([edits[index]])[0]);
+        const nextPageIds = pageOrder.map((index) => pageIds[index]);
+        setEngine(reordered);
+        engineRef.current = reordered;
+        current.close();
+        setEdits(nextEdits);
+        setPageIds(nextPageIds);
+        setSelectedPageIds(nextSelection.filter((id) => nextPageIds.includes(id)));
+        setPageIndex(Math.max(0, nextPageIds.indexOf(nextActivePageId)));
+        setZoom(1);
+        setUndoStack([]);
+        setRedoStack([]);
+        setFileSize(reordered.byteLength);
+        setDirty(true);
+        setStatus(`${message} Edit history was reset.`);
+      } catch (error) {
+        setStatus(`Could not reorganize the pages: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy, edits, pageIds],
+  );
+
+  const movePage = useCallback(
+    (from: number, to: number) => {
+      if (from === to || from < 0 || to < 0 || from >= pageIds.length || to >= pageIds.length) return;
+      const order = pageIds.map((_, index) => index);
+      const [moved] = order.splice(from, 1);
+      order.splice(to, 0, moved);
+      const activeId = pageIds[pageIndex];
+      void applyPageOrder(
+        order,
+        activeId,
+        selectedPageIds,
+        `Moved page ${from + 1} to position ${to + 1}. Crop and rotation edits stayed with the page.`,
+      );
+    },
+    [applyPageOrder, pageIds, pageIndex, selectedPageIds],
+  );
+
+  const toggleSelectedPage = useCallback((pageId: string) => {
+    setSelectedPageIds((current) =>
+      current.includes(pageId)
+        ? current.filter((id) => id !== pageId)
+        : [...current, pageId],
+    );
+  }, []);
+
+  const deleteSelectedPages = useCallback(() => {
+    if (busy || !selectedPageIds.length || selectedPageIds.length >= pageIds.length) return;
+    const selected = new Set(selectedPageIds);
+    const count = selected.size;
+    const positions = pageIds
+      .map((id, index) => selected.has(id) ? index + 1 : -1)
+      .filter((position) => position > 0);
+    const shown = positions.slice(0, 8).join(", ");
+    const pageList = positions.length > 8 ? `${shown}, and ${positions.length - 8} more` : shown;
+    if (!window.confirm(`Remove page${count === 1 ? "" : "s"} ${pageList} from this working copy? This cannot be undone in this session, and crop or rotation edits on those pages will be lost. Your original PDFs will not be changed.`)) return;
+    const order = pageIds
+      .map((_, index) => index)
+      .filter((index) => !selected.has(pageIds[index]));
+    const remainingIds = order.map((index) => pageIds[index]);
+    const currentActiveId = pageIds[pageIndex];
+    const nextActiveId = remainingIds.includes(currentActiveId)
+      ? currentActiveId
+      : remainingIds[Math.min(pageIndex, remainingIds.length - 1)];
+    void applyPageOrder(
+      order,
+      nextActiveId,
+      [],
+      `Removed ${count} page${count === 1 ? "" : "s"} from the working copy. The original PDF is unchanged.`,
+    );
+  }, [applyPageOrder, busy, pageIds, pageIndex, selectedPageIds]);
+
+  const extractSelectedPages = useCallback(async () => {
+    const current = engineRef.current;
+    if (!current || busy || !selectedPageIds.length) return;
+    const selected = new Set(selectedPageIds);
+    const pageOrder = pageIds
+      .map((id, index) => selected.has(id) ? index : -1)
+      .filter((index) => index >= 0);
+    if (!pageOrder.length) return;
+    setBusy(true);
+    setStatus(`Extracting ${pageOrder.length} selected page${pageOrder.length === 1 ? "" : "s"} locally…`);
+    try {
+      const bytes = await current.exportPdf(edits, pageOrder);
+      const baseName = fileName.replace(/\.pdf$/i, "") || "document";
+      const contiguous = pageOrder.every((value, index) => index === 0 || value === pageOrder[index - 1] + 1);
+      const suffix = contiguous
+        ? `pages-${pageOrder[0] + 1}${pageOrder.length > 1 ? `-${pageOrder.at(-1)! + 1}` : ""}`
+        : `${pageOrder.length}-selected-pages`;
+      const downloadName = `${baseName}-${suffix}.pdf`;
+      downloadPdfBytes(bytes, downloadName);
+      setStatus(`Download requested for ${downloadName}. The working PDF and unsaved edits were not changed; retry if your browser did not start the download.`);
+    } catch (error) {
+      setStatus(`Could not extract the selected pages: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, edits, fileName, pageIds, selectedPageIds]);
+
   const downloadPdf = useCallback(async () => {
     if (!engine || busy) return;
     setBusy(true);
     setStatus("Building and verifying your edited PDF…");
     try {
       const bytes = await engine.exportPdf(edits);
-      const blob = new Blob([bytes], { type: "application/pdf" });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
       const baseName = fileName.replace(/\.pdf$/i, "") || "document";
-      anchor.href = url;
-      anchor.download = `${baseName}-edited.pdf`;
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1500);
-      setDirty(false);
-      setStatus(`Saved ${anchor.download} to your device. The original file was not changed, and this app did not upload a copy.`);
+      const downloadName = `${baseName}-edited.pdf`;
+      downloadPdfBytes(bytes, downloadName);
+      setStatus(`Download requested for ${downloadName}. The original file was not changed or uploaded; retry if your browser did not start the download.`);
     } catch (error) {
       setStatus(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -641,26 +994,34 @@ export function App() {
   const submitPassword = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!pendingPassword || busy) return;
-    await openBytes(pendingPassword.file, pendingPassword.bytes, passwordValue);
+    if (pendingPassword.purpose === "append") {
+      await appendBytes(pendingPassword.file, pendingPassword.bytes, passwordValue, pendingPassword.ownerRequired);
+    } else {
+      await openBytes(pendingPassword.file, pendingPassword.bytes, passwordValue, pendingPassword.ownerRequired);
+    }
   };
 
   return (
     <div
       className={`app ${dragActive ? "is-dragging-file" : ""}`}
       onDragEnter={(event) => {
+        if (!Array.from(event.dataTransfer.types).includes("Files")) return;
         event.preventDefault();
         warmPdfEngine();
         if (!busy) setDragActive(true);
       }}
-      onDragOver={(event) => event.preventDefault()}
+      onDragOver={(event) => {
+        if (Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
+      }}
       onDragLeave={(event) => {
         if (event.currentTarget === event.target) setDragActive(false);
       }}
       onDrop={(event) => {
         event.preventDefault();
         setDragActive(false);
-        const file = event.dataTransfer.files[0];
-        if (file) void acceptFile(file);
+        const files = Array.from(event.dataTransfer.files);
+        if (engine && files.length) void acceptAddedFiles(files);
+        else if (files[0]) void acceptFile(files[0]);
       }}
     >
       <input
@@ -674,6 +1035,20 @@ export function App() {
           const file = event.target.files?.[0];
           event.target.value = "";
           if (file) void acceptFile(file);
+        }}
+      />
+      <input
+        ref={addFileInputRef}
+        className="visually-hidden"
+        type="file"
+        tabIndex={-1}
+        aria-hidden="true"
+        accept="application/pdf,.pdf"
+        multiple
+        onChange={(event) => {
+          const files = Array.from(event.target.files ?? []);
+          event.target.value = "";
+          if (files.length) void acceptAddedFiles(files);
         }}
       />
 
@@ -703,6 +1078,18 @@ export function App() {
         >
           <FolderOpen size={18} />
           <span className="open-button-label">{engine ? "Open another" : "Open PDF"}</span>
+        </button>
+
+        <button
+          ref={organizerButtonRef}
+          type="button"
+          className="organize-button"
+          aria-label="Organize, merge, or extract PDF pages"
+          onClick={openOrganizer}
+          disabled={!engine || busy}
+        >
+          <Files size={18} />
+          <span className="organize-button-label">Organize pages</span>
         </button>
 
         <div className="file-summary" aria-live="polite">
@@ -756,6 +1143,7 @@ export function App() {
           <PageRail
             engine={engine}
             pages={pages}
+            pageIds={pageIds}
             edits={edits}
             activePage={pageIndex}
             onSelect={(index) => {
@@ -815,8 +1203,8 @@ export function App() {
           <div className="empty-card">
             <div className="empty-icon"><UploadCloud size={30} /></div>
             <span className="eyebrow">No uploads. No account.</span>
-            <h1>Crop and rotate PDFs,<br />privately in your browser.</h1>
-            <p>Crop, rotate, auto-trim, and batch-edit PDFs locally with a live preview. No file upload, account, or server-side document storage.</p>
+            <h1>Crop, rotate, and organize PDFs,<br />privately in your browser.</h1>
+            <p>Crop, rotate, merge, reorder, extract, and batch-edit PDF pages locally with a live preview. No file upload, account, or server-side document storage.</p>
             <button
               type="button"
               className="primary-hero-button"
@@ -839,8 +1227,8 @@ export function App() {
           </div>
           <div className="feature-strip" aria-label="Main features">
             <span><Sparkles size={16} /> Live precision crop</span>
+            <span><Files size={16} /> Merge &amp; organize pages</span>
             <span><ShieldCheck size={16} /> No document upload</span>
-            <span><Download size={16} /> Download when ready</span>
           </div>
         </main>
       )}
@@ -848,7 +1236,7 @@ export function App() {
       <footer className="status-bar">
         <span className={`status-dot ${busy ? "is-busy" : ""}`} aria-hidden="true" />
         <span className="status-message" role="status" aria-live="polite">{status}</span>
-        <span className="signature-note">Edits invalidate existing digital signatures.</span>
+        <span className="signature-note">Crop is not redaction · edits invalidate signatures.</span>
         <button type="button" className="status-link" onClick={openPrivacy}><ShieldCheck size={15} /> Privacy</button>
         <a href={sourceUrl} target="_blank" rel="noreferrer"><Github size={15} /> Source</a>
       </footer>
@@ -856,9 +1244,37 @@ export function App() {
       {dragActive && (
         <div className="drop-overlay" aria-hidden="true">
           <UploadCloud size={42} />
-          <strong>Drop your PDF here</strong>
+          <strong>{engine ? "Drop PDFs to add their pages" : "Drop your PDF here"}</strong>
           <small>Processed in this tab — not uploaded or stored by the site.</small>
         </div>
+      )}
+
+      {showOrganizer && engine && !pendingPassword && (
+        <PageOrganizer
+          engine={engine}
+          pages={pages}
+          pageIds={pageIds}
+          edits={edits}
+          activePage={pageIndex}
+          selectedPageIds={selectedPageIdSet}
+          busy={busy}
+          status={status}
+          addButtonRef={organizerAddButtonRef}
+          onClose={closeOrganizer}
+          onActivate={(index) => {
+            setPageIndex(index);
+            setZoom(1);
+            setStatus(`Selected page ${index + 1} for editing.`);
+          }}
+          onToggleSelected={toggleSelectedPage}
+          onSelectAll={() => setSelectedPageIds([...pageIds])}
+          onClearSelection={() => setSelectedPageIds([])}
+          onMove={movePage}
+          onAddPdf={chooseAddedFiles}
+          onExtract={() => void extractSelectedPages()}
+          onDelete={deleteSelectedPages}
+          onDialogKeyDown={(event) => handleDialogKeyDown(event, closeOrganizer, busy)}
+        />
       )}
 
       {pendingPassword && (
@@ -881,12 +1297,20 @@ export function App() {
               <X size={18} />
             </button>
             <div className="modal-icon"><ShieldCheck size={22} /></div>
-            <h2 id="password-title">{pendingPassword.ownerRequired ? "Owner password required" : "Unlock this PDF"}</h2>
+            <h2 id="password-title">
+              {pendingPassword.ownerRequired
+                ? "Owner password required"
+                : pendingPassword.purpose === "append"
+                  ? "Unlock PDF to add pages"
+                  : "Unlock this PDF"}
+            </h2>
             <p>{pendingPassword.message}</p>
             <label className="field-label" htmlFor="pdf-password">Password</label>
             <input id="pdf-password" type="password" autoFocus autoComplete="off" value={passwordValue} onChange={(event) => setPasswordValue(event.target.value)} />
             <p className="privacy-copy">Your password is held only in this tab for the active editing session. It is not transmitted or stored on a server.</p>
-            <button className="primary-button full-button" type="submit" disabled={busy}>{busy ? "Unlocking…" : "Unlock PDF"}</button>
+            <button className="primary-button full-button" type="submit" disabled={busy}>
+              {busy ? "Unlocking…" : pendingPassword.purpose === "append" ? "Unlock and add pages" : "Unlock PDF"}
+            </button>
           </form>
         </div>
       )}
@@ -904,10 +1328,11 @@ export function App() {
             <button type="button" className="modal-close" aria-label="Close" autoFocus onClick={closeAbout}><X size={18} /></button>
             <div className="modal-icon"><FileText size={22} /></div>
             <h2 id="about-title">CropRotate PDF</h2>
-            <p>A private, open-source PDF crop and rotation tool. Documents are processed in this browser tab with MuPDF WebAssembly.</p>
+            <p>A private, open-source PDF crop, rotation, and page-organization tool. Documents are processed in this browser tab with MuPDF WebAssembly.</p>
             <ul>
               <li>No document uploads, accounts, or analytics</li>
               <li>Non-destructive CropBox editing</li>
+              <li>Local PDF merging, reordering, removal, and extraction</li>
               <li>AGPL-3.0-or-later licensed</li>
             </ul>
             <p className="legal-copy">You keep ownership of documents you open and outputs you create. Copyright © 2026 CropRotate PDF contributors. This program comes with no warranty.</p>
@@ -934,12 +1359,14 @@ export function App() {
             <button type="button" className="modal-close" aria-label="Close privacy information" autoFocus onClick={closePrivacy}><X size={18} /></button>
             <div className="modal-icon"><ShieldCheck size={22} /></div>
             <h2 id="privacy-title">Privacy &amp; data ownership</h2>
-            <p id="privacy-summary"><strong>Private by design.</strong> Your PDF and password are processed only in this browser tab. This app does not upload them or store a server-side copy. Edits are temporary until you download the result; closing or reloading the tab discards the working session.</p>
+            <p id="privacy-summary"><strong>Private by design.</strong> Your PDFs and passwords are processed only in this browser tab. This app does not upload them or store a server-side copy. Edits are temporary until you download the result; closing or reloading the tab discards the working session.</p>
             <ul className="privacy-list">
-              <li>PDF bytes, previews, passwords, edits, and undo history remain in this tab's memory during the working session.</li>
+              <li>PDF bytes, previews, passwords, page organization, edits, and undo history remain in this tab's memory during the working session.</li>
               <li>The app uses no cookies, local storage, browser database, analytics, or server database to store your documents or editing data.</li>
-              <li>Only choosing <strong>Save local copy</strong> creates an output file, using your browser's normal download behavior.</li>
-              <li>GitHub Pages receives ordinary web-request metadata, and your browser may cache the app's static code. Your selected PDF is not included in those requests.</li>
+              <li>Only choosing <strong>Save local copy</strong> or <strong>Extract selected</strong> requests an output download through your browser.</li>
+              <li>Cropping changes the PDF's visible page box; it is not redaction and does not erase hidden content outside the crop.</li>
+              <li>The app is not a malware scanner or PDF sanitizer; active content and attachments may remain in exported files.</li>
+              <li>GitHub Pages receives ordinary web-request metadata, and your browser may cache the app's static code. Your selected PDFs are not included in those requests.</li>
               <li>Browser extensions, operating-system memory handling, and cloud-synced download folders are outside this app's control.</li>
             </ul>
             <p className="ownership-copy"><strong>You keep control of your documents.</strong> This app does not claim ownership of files you open or outputs you create.</p>

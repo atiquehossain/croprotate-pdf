@@ -107,7 +107,7 @@
       <p class="eyebrow">Privacy notice</p>
       <h1>Private by design</h1>
       <p>
-        CropRotate PDF edits documents locally in your browser. Your PDF and any password you
+        CropRotate PDF edits documents locally in your browser. Your PDFs and any passwords you
         enter are processed only in the active browser tab. The app does not upload them or keep
         a server-side copy.
       </p>
@@ -122,25 +122,39 @@
 
       <h2>What stays in the tab</h2>
       <p>
-        The selected PDF bytes, generated previews, password, crop and rotation choices, and
-        undo history live in browser memory for the active editing session. CropRotate PDF does
+        Selected PDF bytes, generated previews, passwords, crop and rotation choices, page
+        order, selections, and undo history live in browser memory for the active editing session.
+        Merging, reordering, removal, and extraction also happen in that tab. CropRotate PDF does
         not use cookies, local storage, session storage, IndexedDB, analytics, or a server
         database to retain those document contents.
       </p>
 
       <h2>When data leaves the tab</h2>
       <ul>
-        <li>A new PDF is saved only when you explicitly choose to download it.</li>
+        <li>A new PDF download is requested only when you explicitly choose <strong>Save local copy</strong> or <strong>Extract selected</strong>.</li>
         <li>The original file is not modified by the app.</li>
         <li>Reloading, closing the tab, or opening another PDF ends the current working session.</li>
       </ul>
+
+      <h2>Cropping is not redaction</h2>
+      <p>
+        Cropping changes which part of a PDF page is visible. It does not reliably erase content
+        outside the crop. Use a dedicated redaction tool when hidden content must be permanently removed.
+      </p>
+
+      <h2>Editing is not sanitizing</h2>
+      <p>
+        CropRotate PDF is not a malware scanner or PDF sanitizer. Active content, actions,
+        attachments, and other data from an original PDF may remain in an exported file. Open
+        only documents you trust and continue treating outputs as untrusted when their source was untrusted.
+      </p>
 
       <h2>Hosting and ordinary connection data</h2>
       <p>
         The static app is hosted on GitHub Pages. Like other web hosts, GitHub may receive
         ordinary connection information such as an IP address, request time, requested page,
         browser details, and referring page. Your browser may cache the app's code and visual
-        assets for performance. Neither of these actions sends the PDF you selected to the app's
+        assets for performance. Neither of these actions sends the PDFs you selected to the app's
         host.
       </p>
 
@@ -158,7 +172,7 @@
         PDF does not claim ownership of them.
       </p>
 
-      <footer>Last updated September 25, 2026.</footer>
+      <footer>Last updated October 1, 2026.</footer>
     </main>
   </body>
 </html>

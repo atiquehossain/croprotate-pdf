@@ -1,7 +1,7 @@
 {
   "name": "CropRotate PDF",
   "short_name": "CropRotate",
-  "description": "Crop, rotate and auto-trim PDF pages privately in your browser.",
+  "description": "Crop, rotate, merge and organize PDF pages privately in your browser.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

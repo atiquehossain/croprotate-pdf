@@ -1,8 +1,8 @@
 # CropRotate PDF
 
-**Crop and rotate PDFs privately — this app does not upload your document.**
+**Crop, rotate, merge and organize PDFs privately — this app does not upload your documents.**
 
-CropRotate PDF is a free, browser-based PDF crop and rotation editor with live previews, precise controls, auto-trim, and batch editing. It is a static web app: the selected PDF is processed in the current browser tab, with no document upload API, account, analytics, or server-side document copy.
+CropRotate PDF is a free, browser-based PDF editor with live previews, precise crop and rotation controls, auto-trim, batch editing, and a visual page organizer. It is a static web app: selected PDFs are processed in the current browser tab, with no document upload API, account, analytics, or server-side document copy.
 
 ## Features
 
@@ -13,20 +13,29 @@ CropRotate PDF is a free, browser-based PDF crop and rotation editor with live p
 - Aspect-ratio presets and optional ratio-locked resizing
 - Local auto-trim with sensitivity, padding, and annotation controls
 - Batch crop/rotation for all, odd, even, or selected page ranges
+- Merge multiple PDFs locally by adding their pages to the open document
+- Reorder pages by dragging or with accessible move controls
+- Remove unwanted pages and extract selected pages as a separate PDF
 - Document-wide undo and redo
-- Password-protected PDF support, with original encryption retained on export
+- Password-protected PDF support, with the first PDF's encryption retained in combined outputs
 - Responsive desktop and mobile layout
 - No backend, database, API key, account, or paid hosting required
 
-PDF cropping changes each page's PDF `CropBox`; it does not reliably erase content outside the visible crop. Editing can also invalidate existing digital signatures. Use a dedicated redaction tool when content must be permanently removed.
+Undo and redo cover crop and rotation edits. Merging, moving, or removing pages keeps those edits attached to the correct pages but resets their undo history.
+
+Combined PDFs use the first PDF's encryption, open password, and permission settings. The app blocks a merge when the first PDF's settings would remove another PDF's encryption or required open password; open that protected PDF first. It cannot compare password strength or encryption algorithms, and settings from additional PDFs are not carried into the combined file.
+
+PDF cropping changes each page's PDF `CropBox`; it does not reliably erase content outside the visible crop. Editing or reorganizing pages can invalidate existing digital signatures. Structural edits rebuild the working PDF, and document-level features such as bookmarks, attachments, page labels, JavaScript, or some form structures—especially from added PDFs—may not carry over. Keep the originals, and use a dedicated redaction tool when content must be permanently removed.
+
+CropRotate PDF is an editor, not a malware scanner or PDF sanitizer. Active content, actions, attachments, and other data from an original PDF may remain in an exported file. Open only documents you trust and continue treating edited outputs as untrusted when their source was untrusted.
 
 ## Privacy model
 
-PDF bytes, rendered previews, passwords, edits, and undo history are held only in the current browser tab's memory while the app is open. CropRotate PDF does not upload them, write them to browser storage, or keep a server-side copy. Reloading or closing the tab discards the working session. A new output file is saved only when the user explicitly downloads it; the original file is not changed.
+PDF bytes, rendered previews, passwords, edits, selections, and undo history are held only in the current browser tab's memory while the app is open. Merging, reordering, removal, and extraction also happen in memory. CropRotate PDF does not upload those files or details, write them to browser storage, or keep a server-side copy. Reloading or closing the tab discards the working session. A new output file is saved only when the user explicitly downloads it; original files are not changed.
 
 The user keeps ownership and control of opened documents and created outputs. The app does not claim rights to either.
 
-The static host still receives ordinary web-request metadata, such as an IP address and user agent, when it serves the app. A browser or intermediary may cache the app's HTML, JavaScript, WebAssembly, fonts, icons, and styles, but the application does not send the selected PDF for that cache. Browser extensions, operating-system features, download locations, and cloud-synced folders are outside this app's control.
+The static host still receives ordinary web-request metadata, such as an IP address and user agent, when it serves the app. A browser or intermediary may cache the app's HTML, JavaScript, WebAssembly, fonts, icons, and styles, but the application does not send selected PDFs for that cache. Browser extensions, operating-system features, download locations, and cloud-synced folders are outside this app's control.
 
 This description applies to the code in this repository. If you modify the project, add analytics, or add a backend, update the visible privacy notice before publishing.
 
@@ -99,7 +108,7 @@ npm run preview
 
 The optimized static site is written to `dist/`. Serve it over HTTP or HTTPS; WebAssembly workers may not function if `index.html` is opened directly with `file://`.
 
-The app targets current Chrome, Edge, Firefox, and Safari releases with WebAssembly and Web Workers enabled. Exceptionally large or image-heavy PDFs may exceed a browser's memory limit, especially on mobile devices; splitting the document first is the practical workaround. Restricted PDFs may require the owner password before editing is permitted.
+The app targets current Chrome, Edge, Firefox, and Safari releases with WebAssembly and Web Workers enabled. For browser safety, it accepts files up to 75 MB each, a working set up to 100 MB, and documents up to 1,000 pages. Image-heavy or unusually complex files can still exceed a device's memory limit, especially on mobile devices; splitting the document first is the practical workaround. Restricted PDFs may require the owner password before editing, copying, or page assembly is permitted.
 
 ## License
 

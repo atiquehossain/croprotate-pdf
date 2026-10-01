@@ -7,11 +7,12 @@ interface ThumbnailProps {
   engine: PdfEngine;
   info: PageInfo;
   edit: PageEdit;
+  position: number;
   active: boolean;
   onSelect: () => void;
 }
 
-function Thumbnail({ engine, info, edit, active, onSelect }: ThumbnailProps) {
+function Thumbnail({ engine, info, edit, position, active, onSelect }: ThumbnailProps) {
   const rootRef = useRef<HTMLButtonElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [visible, setVisible] = useState(active);
@@ -63,13 +64,13 @@ function Thumbnail({ engine, info, edit, active, onSelect }: ThumbnailProps) {
       type="button"
       className={`thumbnail ${active ? "is-active" : ""}`}
       aria-current={active ? "page" : undefined}
-      aria-label={`Show page ${info.index + 1}`}
+      aria-label={`Show page ${position + 1}`}
       onClick={onSelect}
     >
       <span className="thumbnail-paper">
-        {visible ? <canvas ref={canvasRef} aria-hidden="true" /> : <span>{info.index + 1}</span>}
+        {visible ? <canvas ref={canvasRef} aria-hidden="true" /> : <span>{position + 1}</span>}
       </span>
-      <span className="thumbnail-label">{info.label}</span>
+      <span className="thumbnail-label">Page {position + 1}</span>
     </button>
   );
 }
@@ -77,12 +78,13 @@ function Thumbnail({ engine, info, edit, active, onSelect }: ThumbnailProps) {
 interface PageRailProps {
   engine: PdfEngine;
   pages: PageInfo[];
+  pageIds: string[];
   edits: PageEdit[];
   activePage: number;
   onSelect: (index: number) => void;
 }
 
-export function PageRail({ engine, pages, edits, activePage, onSelect }: PageRailProps) {
+export function PageRail({ engine, pages, pageIds, edits, activePage, onSelect }: PageRailProps) {
   const activeRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -98,10 +100,11 @@ export function PageRail({ engine, pages, edits, activePage, onSelect }: PageRai
       <div className="thumbnail-list" ref={activeRef}>
         {pages.map((page, index) => (
           <Thumbnail
-            key={page.index}
+            key={pageIds[index] ?? page.index}
             engine={engine}
             info={page}
             edit={edits[index]}
+            position={index}
             active={index === activePage}
             onSelect={() => onSelect(index)}
           />
