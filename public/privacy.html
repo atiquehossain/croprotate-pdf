@@ -10,7 +10,7 @@
     <title>Privacy Notice | CropRotate PDF</title>
     <meta
       name="description"
-      content="How CropRotate PDF processes PDFs locally in your browser without document uploads or server-side file storage."
+      content="How CropRotate PDF processes PDFs, annotations and visual signatures locally without uploads, analytics or server-side file storage."
     />
     <meta name="robots" content="index, follow, max-image-preview:large" />
     <meta name="theme-color" content="#101414" />
@@ -25,9 +25,9 @@
       <p class="eyebrow">Privacy notice</p>
       <h1>Private by design</h1>
       <p>
-        CropRotate PDF edits documents locally in your browser. Your PDFs and any passwords you
-        enter are processed only in the active browser tab. The app does not upload them or keep
-        a server-side copy.
+        CropRotate PDF edits documents locally in your browser. Your PDFs, annotations, visual
+        signatures or initials, and any passwords you enter are processed only in the active
+        browser tab. The app does not upload them or keep a server-side copy.
       </p>
 
       <div class="summary">
@@ -41,7 +41,8 @@
       <h2>What stays in the tab</h2>
       <p>
         Selected PDF bytes, generated previews, passwords, crop and rotation choices, page
-        order, selections, and undo history live in browser memory for the active editing session.
+        order, annotations, drawn or typed signatures and initials, selections, and undo history
+        live in browser memory for the active editing session.
         Merging, splitting, duplication, reordering, removal, and extraction also happen in that tab. CropRotate PDF does
         not use cookies, local storage, session storage, IndexedDB, analytics, or a server
         database to retain those document contents.
@@ -53,6 +54,26 @@
         <li>The original file is not modified by the app.</li>
         <li>Reloading, closing the tab, or opening another PDF ends the current working session.</li>
       </ul>
+
+      <h2>Annotations and visual signatures</h2>
+      <p>
+        Pen, highlighter, text, date, check, cross, line, arrow, rectangle, and ellipse marks are
+        created in the active tab. Drawn and typed signatures and initials are visual marks only:
+        they are not certificate-backed digital signatures, do not verify identity, and do not
+        provide cryptographic proof of who signed or whether the document later changed.
+      </p>
+      <p>
+        When you export, annotations created in CropRotate PDF are flattened into the page content
+        so they are no longer editable as separate PDF annotations. Annotations already present in
+        the original PDF are preserved as PDF annotations. Editing or exporting a document can
+        invalidate a certificate-backed digital signature that was already in the PDF, so keep the
+        original when signature validation matters.
+      </p>
+      <p>
+        Typed annotations and typed signatures use built-in PDF fonts. If a character cannot be
+        exported by those fonts, the app stops the export instead of silently dropping it. Use the
+        pen or a drawn signature for that text.
+      </p>
 
       <h2>Cropping is not redaction</h2>
       <p>

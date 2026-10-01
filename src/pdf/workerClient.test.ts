@@ -161,6 +161,47 @@ describe("PdfWorkerClient", () => {
     client.terminate();
   });
 
+  it("sends source-page annotations with an export request", async () => {
+    const worker = new MockWorker();
+    const client = new PdfWorkerClient(() => worker);
+    const opening = client.open(new Uint8Array([1]));
+    const openRequest = latestRequest(worker);
+    worker.emit({
+      type: "result",
+      requestId: openRequest.requestId,
+      operation: "open",
+      value: snapshot(),
+    });
+    const document = await opening;
+    const annotations = [[{
+      id: "stroke-1",
+      pageId: "page-1",
+      kind: "ink" as const,
+      tool: "signature" as const,
+      color: "#111111",
+      opacity: 1,
+      width: 2,
+      strokes: [[{ x: 0.1, y: 0.2 }, { x: 0.8, y: 0.7 }]],
+    }]];
+
+    const exporting = document.exportPdf([{ rotation: 0, crop: null }], undefined, {
+      annotations,
+    });
+    const exportRequest = latestRequest(worker);
+    expect(exportRequest).toMatchObject({
+      operation: "export",
+      payload: { documentId: "doc-1", annotations },
+    });
+    worker.emit({
+      type: "result",
+      requestId: exportRequest.requestId,
+      operation: "export",
+      value: new Uint8Array([4, 2]),
+    });
+    await expect(exporting).resolves.toEqual(new Uint8Array([4, 2]));
+    client.terminate();
+  });
+
   it("releases a document that finishes after its request was cancelled", async () => {
     const worker = new MockWorker();
     const client = new PdfWorkerClient(() => worker);

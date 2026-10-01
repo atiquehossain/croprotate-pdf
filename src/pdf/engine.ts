@@ -1,4 +1,5 @@
 import * as mupdf from "mupdf";
+import type { Annotation } from "../annotations/types";
 import type {
   PageEdit,
   PageInfo,
@@ -9,6 +10,7 @@ import type {
   VisualRect,
 } from "../types";
 import { normalizeRotation, totalRotation, visualPageDimensions } from "./geometry";
+import { addAnnotationsToPage, validateAnnotationPages } from "./annotationExport";
 
 const MAX_RENDER_DIMENSION = 3_200;
 const MAX_RENDER_PIXELS = 5_000_000;
@@ -28,6 +30,16 @@ export interface PdfEngineProgress {
 export interface PdfEngineOperationOptions {
   signal?: AbortSignal;
   onProgress?: (progress: PdfEngineProgress) => void;
+}
+
+export interface PdfEngineExportOptions extends PdfEngineOperationOptions {
+  /** Source-page-indexed annotation arrays in normalized PDF coordinates. */
+  annotations?: readonly (readonly Annotation[])[];
+}
+
+interface DetachedAnnotationArray {
+  pageIndex: number;
+  value: mupdf.PDFObject;
 }
 
 function abortError(): Error {
@@ -415,7 +427,7 @@ export class PdfEngine {
   async exportPdf(
     edits: PageEdit[],
     pageOrder?: readonly number[],
-    options?: PdfEngineOperationOptions,
+    options?: PdfEngineExportOptions,
   ): Promise<Uint8Array<ArrayBuffer>> {
     if (!this.canEdit) throw new Error("This PDF does not allow editing.");
     if (pageOrder !== undefined && (!this.canAssemble || !this.canCopy)) {
@@ -423,15 +435,24 @@ export class PdfEngine {
     }
     throwIfAborted(options?.signal);
     const pagesToEdit = pageOrder?.length ?? edits.length;
-    const totalSteps = pagesToEdit + 2;
+    const annotations = options?.annotations;
+    if (edits.length !== this.pageInfos.length) {
+      throw new Error("The page edit list no longer matches this PDF.");
+    }
+    if (annotations !== undefined) {
+      if (annotations.length !== edits.length) {
+        throw new Error("The page annotation list no longer matches this PDF.");
+      }
+      validateAnnotationPages(annotations);
+    }
+    const hasAnnotations = annotations?.some((pageAnnotations) => pageAnnotations.length > 0) ?? false;
+    const totalSteps = pagesToEdit + (hasAnnotations ? 3 : 2);
     reportProgress(options, "applying-edits", 0, totalSteps);
     await yieldForCancellation(options?.signal);
     const outputDocument = this.openOriginalDocument();
     let outputBuffer: mupdf.Buffer | null = null;
+    let detachedAnnotationArrays: DetachedAnnotationArray[] = [];
     try {
-      if (edits.length !== outputDocument.countPages()) {
-        throw new Error("The page edit list no longer matches this PDF.");
-      }
       if (pageOrder !== undefined) this.validatePageOrder(pageOrder);
 
       // Ordered exports are the hot path for extraction and splitting. Arrange
@@ -442,6 +463,14 @@ export class PdfEngine {
       if (pageOrder !== undefined) {
         const materializedOrder = this.materializeDuplicatePages(outputDocument, pageOrder);
         outputDocument.rearrangePages(materializedOrder);
+      }
+
+      // `PDFDocument.bake` is global. Temporarily detach every pre-existing
+      // annotation array so only annotations created by this app are flattened.
+      // The original comments, stamps, signatures, and form widgets are put
+      // back unchanged immediately after baking.
+      if (hasAnnotations) {
+        detachedAnnotationArrays = this.detachAnnotationArrays(outputDocument);
       }
 
       for (let outputIndex = 0; outputIndex < pagesToEdit; outputIndex += 1) {
@@ -474,15 +503,31 @@ export class PdfEngine {
           } finally {
             pageObject.destroy();
           }
+          if (annotations !== undefined) {
+            addAnnotationsToPage(page, info, annotations[sourceIndex]);
+          }
         } finally {
           page.destroy();
         }
         reportProgress(options, "applying-edits", outputIndex + 1, totalSteps);
         await yieldForCancellation(options?.signal);
       }
+      if (hasAnnotations) {
+        throwIfAborted(options?.signal);
+        reportProgress(options, "flattening-annotations", pagesToEdit + 1, totalSteps);
+        await yieldForCancellation(options?.signal);
+        outputDocument.bake(true, false);
+        this.restoreAnnotationArrays(outputDocument, detachedAnnotationArrays);
+        await yieldForCancellation(options?.signal);
+      }
 
       throwIfAborted(options?.signal);
-      reportProgress(options, "saving", pagesToEdit + 1, totalSteps);
+      reportProgress(
+        options,
+        "saving",
+        pagesToEdit + (hasAnnotations ? 2 : 1),
+        totalSteps,
+      );
       outputBuffer = outputDocument.saveToBuffer(
         "garbage=2,compress,encrypt=keep",
       );
@@ -517,6 +562,7 @@ export class PdfEngine {
       reportProgress(options, "ready", totalSteps, totalSteps);
       return bytes;
     } finally {
+      for (const detached of detachedAnnotationArrays) detached.value.destroy();
       outputBuffer?.destroy();
       outputDocument.destroy();
     }
@@ -583,6 +629,46 @@ export class PdfEngine {
       return materialized;
     } finally {
       graftMap?.destroy();
+    }
+  }
+
+  private detachAnnotationArrays(document: mupdf.PDFDocument): DetachedAnnotationArray[] {
+    const detached: DetachedAnnotationArray[] = [];
+    for (let pageIndex = 0; pageIndex < document.countPages(); pageIndex += 1) {
+      const page = document.loadPage(pageIndex);
+      try {
+        const pageObject = page.getObject();
+        try {
+          const annotationArray = pageObject.get("Annots");
+          if (annotationArray.isNull()) continue;
+          pageObject.delete("Annots");
+          detached.push({ pageIndex, value: annotationArray });
+        } finally {
+          pageObject.destroy();
+        }
+      } finally {
+        page.destroy();
+      }
+    }
+    return detached;
+  }
+
+  private restoreAnnotationArrays(
+    document: mupdf.PDFDocument,
+    detached: readonly DetachedAnnotationArray[],
+  ): void {
+    for (const { pageIndex, value } of detached) {
+      const page = document.loadPage(pageIndex);
+      try {
+        const pageObject = page.getObject();
+        try {
+          pageObject.put("Annots", value)?.destroy?.();
+        } finally {
+          pageObject.destroy();
+        }
+      } finally {
+        page.destroy();
+      }
     }
   }
 

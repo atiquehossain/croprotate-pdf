@@ -8,6 +8,7 @@ import type {
 } from "../types";
 import type {
   PdfDocumentSnapshot,
+  PdfExportOptions,
   PdfWorkerOperation,
   PdfWorkerOperationOptions,
   PdfWorkerOutboundMessage,
@@ -17,6 +18,7 @@ import type {
 
 export type {
   PdfDocumentSnapshot,
+  PdfExportOptions,
   PdfWorkerOperation,
   PdfWorkerOperationOptions,
   PdfWorkerProgress,
@@ -388,7 +390,7 @@ export class PdfWorkerDocument {
   async exportPdf(
     edits: PageEdit[],
     pageOrder?: readonly number[],
-    options?: PdfWorkerOperationOptions,
+    options?: PdfExportOptions,
   ): Promise<Uint8Array<ArrayBuffer>> {
     this.assertOpen();
     return await this.client.requestValue(
@@ -398,6 +400,9 @@ export class PdfWorkerDocument {
           documentId: this.documentId,
           edits,
           ...(pageOrder === undefined ? {} : { pageOrder: [...pageOrder] }),
+          ...(options?.annotations === undefined
+            ? {}
+            : { annotations: options.annotations }),
         },
       },
       options,

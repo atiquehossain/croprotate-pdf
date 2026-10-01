@@ -6,6 +6,7 @@ import type {
   TrimSensitivity,
   VisualRect,
 } from "../types";
+import type { Annotation } from "../annotations/types";
 
 export type PdfWorkerOperation =
   | "open"
@@ -41,6 +42,11 @@ export interface PdfWorkerProgress {
 export interface PdfWorkerOperationOptions {
   signal?: AbortSignal;
   onProgress?: (progress: PdfWorkerProgress) => void;
+}
+
+export interface PdfExportOptions extends PdfWorkerOperationOptions {
+  /** Current-source-page-indexed annotation arrays. Data stays in the worker. */
+  annotations?: readonly (readonly Annotation[])[];
 }
 
 export type PdfWorkerRequest =
@@ -91,7 +97,12 @@ export type PdfWorkerRequest =
       type: "request";
       requestId: string;
       operation: "export";
-      payload: { documentId: string; edits: PageEdit[]; pageOrder?: number[] };
+      payload: {
+        documentId: string;
+        edits: PageEdit[];
+        pageOrder?: number[];
+        annotations?: readonly (readonly Annotation[])[];
+      };
     }
   | {
       type: "request";
@@ -176,6 +187,7 @@ export function progressMessage(operation: PdfWorkerOperation, stage: string): s
     },
     export: {
       "applying-edits": "Applying page edits…",
+      "flattening-annotations": "Flattening annotations privately…",
       saving: "Building your PDF…",
       ready: "PDF ready to download.",
     },

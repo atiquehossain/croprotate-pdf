@@ -53,9 +53,50 @@ import { pushBoundedHistory } from "./utils/boundedHistory";
 import { bytesToWholeMebibytes, splitOutputLimitBytes } from "./utils/memoryLimits";
 import { createStoredZipInWorker } from "./utils/zipClient";
 import { usePwa } from "./pwa/usePwa";
+import {
+  addAnnotation,
+  annotationsForPageOrder,
+  canRedoAnnotations,
+  canUndoAnnotations,
+  cloneAnnotationDocument,
+  commitAnnotationHistory,
+  createAnnotationDocument,
+  createAnnotationHistory,
+  deleteAnnotations,
+  duplicateAnnotations,
+  duplicatePageAnnotations,
+  findAnnotation,
+  getPageAnnotations,
+  redoAnnotationHistory,
+  removeAnnotationPage,
+  resetAnnotationHistory,
+  undoAnnotationHistory,
+  updateAnnotation,
+  sourcePointToViewport,
+  viewportPointToSource,
+  type Annotation,
+  type AnnotationDocument,
+  type AnnotationHistory,
+  type AnnotationPoint,
+  type AnnotationRect,
+  type AnnotationStyle,
+  type AnnotationTool,
+  type AnnotationViewportTransform,
+} from "./annotations";
+import {
+  AnnotationToolbar,
+  SignatureDialog,
+  TextAnnotationDialog,
+  type NewAnnotation,
+  type SignatureDraft,
+  type SignatureKind,
+  type TextComposerTool,
+  type TextComposerValue,
+} from "./components/annotations";
 
 type PdfEngine = PdfWorkerDocument;
 type PdfEngineModule = typeof import("./pdf/workerClient");
+type EditorMode = "crop" | "annotate";
 
 interface OperationState {
   id: number;
@@ -74,6 +115,7 @@ interface OperationHandle {
 interface DocumentSnapshot {
   bytes: Uint8Array<ArrayBuffer>;
   edits: PageEdit[];
+  annotations: AnnotationDocument;
   pageIds: string[];
   selectedPageIds: string[];
   activePageId: string;
@@ -119,6 +161,7 @@ interface PendingPassword {
 }
 
 let fallbackPageId = 0;
+let fallbackAnnotationId = 0;
 
 function createPageId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -130,6 +173,74 @@ function createPageId(): string {
 
 function createPageIds(count: number): string[] {
   return Array.from({ length: count }, createPageId);
+}
+
+function createAnnotationId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  fallbackAnnotationId += 1;
+  return `annotation-${Date.now()}-${fallbackAnnotationId}`;
+}
+
+const DEFAULT_ANNOTATION_STYLE: AnnotationStyle = {
+  color: "#111827",
+  opacity: 1,
+  width: 2,
+};
+
+const DEFAULT_HIGHLIGHT_STYLE: AnnotationStyle = {
+  color: "#facc15",
+  opacity: 0.35,
+  width: 18,
+};
+
+function clampUnit(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
+function viewportRectToSourceBounds(
+  rect: AnnotationRect,
+  transform: AnnotationViewportTransform,
+): AnnotationRect {
+  const corners = [
+    { x: rect.x, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y + rect.height },
+    { x: rect.x, y: rect.y + rect.height },
+  ].map((point) => viewportPointToSource(point, transform));
+  const xs = corners.map(({ x }) => x);
+  const ys = corners.map(({ y }) => y);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return {
+    x,
+    y,
+    width: Math.max(...xs) - x,
+    height: Math.max(...ys) - y,
+  };
+}
+
+function placementRect(
+  sourcePoint: AnnotationPoint,
+  widthPoints: number,
+  heightPoints: number,
+  transform: AnnotationViewportTransform,
+  visibleWidthPoints: number,
+  visibleHeightPoints: number,
+): { viewport: AnnotationRect; source: AnnotationRect } {
+  const anchor = sourcePointToViewport(sourcePoint, transform);
+  const width = Math.min(0.9, widthPoints / Math.max(visibleWidthPoints, 1));
+  const height = Math.min(0.9, heightPoints / Math.max(visibleHeightPoints, 1));
+  const viewport: AnnotationRect = {
+    x: clampUnit(anchor.x - width / 2),
+    y: clampUnit(anchor.y - height / 2),
+    width,
+    height,
+  };
+  viewport.x = Math.min(viewport.x, 1 - viewport.width);
+  viewport.y = Math.min(viewport.y, 1 - viewport.height);
+  return { viewport, source: viewportRectToSourceBounds(viewport, transform) };
 }
 
 function combinedFileName(fileName: string): string {
@@ -266,6 +377,26 @@ export function App() {
   const [redoStack, setRedoStack] = useState<PageEdit[][]>([]);
   const [structureUndoStack, setStructureUndoStack] = useState<DocumentSnapshot[]>([]);
   const [structureRedoStack, setStructureRedoStack] = useState<DocumentSnapshot[]>([]);
+  const [annotationHistory, setAnnotationHistory] = useState<AnnotationHistory>(() =>
+    createAnnotationHistory(createAnnotationDocument()),
+  );
+  const [editorMode, setEditorMode] = useState<EditorMode>("crop");
+  const [annotationTool, setAnnotationTool] = useState<AnnotationTool>("select");
+  const [annotationStyles, setAnnotationStyles] = useState({
+    standard: DEFAULT_ANNOTATION_STYLE,
+    highlighter: DEFAULT_HIGHLIGHT_STYLE,
+  });
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const [signatureDrafts, setSignatureDrafts] = useState<Record<SignatureKind, SignatureDraft | null>>({
+    signature: null,
+    initial: null,
+  });
+  const [signatureDialogKind, setSignatureDialogKind] = useState<SignatureKind | null>(null);
+  const [pendingSignaturePoint, setPendingSignaturePoint] = useState<AnnotationPoint | null>(null);
+  const [textDialogRequest, setTextDialogRequest] = useState<{
+    tool: TextComposerTool;
+    point: AnnotationPoint;
+  } | null>(null);
   const [pageIndex, setPageIndex] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [aspectPreset, setAspectPreset] = useState<AspectPreset>("Free");
@@ -285,6 +416,27 @@ export function App() {
   const pages = engine?.pageInfos ?? [];
   const currentPage = pages[pageIndex];
   const currentEdit = edits[pageIndex];
+  const currentPageId = pageIds[pageIndex] ?? "";
+  const currentAnnotations = useMemo(
+    () => currentPageId ? getPageAnnotations(annotationHistory.present, currentPageId) : [],
+    [annotationHistory.present, currentPageId],
+  );
+  const exportAnnotations = useMemo(
+    () => annotationsForPageOrder(annotationHistory.present, pageIds),
+    [annotationHistory.present, pageIds],
+  );
+  const selectedAnnotation = selectedAnnotationId
+    ? findAnnotation(annotationHistory.present, selectedAnnotationId)
+    : undefined;
+  const activeAnnotationStyle: AnnotationStyle = annotationTool === "select" && selectedAnnotation
+    ? {
+        color: selectedAnnotation.color,
+        opacity: selectedAnnotation.opacity,
+        width: selectedAnnotation.width,
+      }
+    : annotationTool === "highlighter"
+      ? annotationStyles.highlighter
+      : annotationStyles.standard;
   const selectedPageIdSet = useMemo(() => new Set(selectedPageIds), [selectedPageIds]);
   const sourceUrl = useMemo(inferSourceUrl, []);
   const privacyUrl = `${import.meta.env.BASE_URL}privacy.html`;
@@ -294,7 +446,7 @@ export function App() {
       : `${sourceUrl.replace(/\/$/, "")}/blob/main/LICENSE`,
     [sourceUrl],
   );
-  const modalOpen = pendingPassword !== null || showAbout || showPrivacy || showOrganizer;
+  const modalOpen = pendingPassword !== null || showAbout || showPrivacy || showOrganizer || signatureDialogKind !== null || textDialogRequest !== null;
 
   const handleFatalWorkerError = useCallback((failedClient: PdfWorkerClient, error: Error) => {
     if (workerClientRef.current !== failedClient) return;
@@ -318,6 +470,14 @@ export function App() {
     setRedoStack([]);
     setStructureUndoStack([]);
     setStructureRedoStack([]);
+    setAnnotationHistory(createAnnotationHistory(createAnnotationDocument()));
+    setEditorMode("crop");
+    setAnnotationTool("select");
+    setSelectedAnnotationId(null);
+    setSignatureDrafts({ signature: null, initial: null });
+    setSignatureDialogKind(null);
+    setPendingSignaturePoint(null);
+    setTextDialogRequest(null);
     setPageIndex(0);
     setZoom(1);
     setAspectPreset("Free");
@@ -500,6 +660,10 @@ export function App() {
   }, [engine]);
 
   useEffect(() => {
+    setSelectedAnnotationId(null);
+  }, [pageIndex]);
+
+  useEffect(() => {
     if (!shouldWarmPdfEngineOnIdle()) return;
 
     const idleWindow = window as Window & typeof globalThis & {
@@ -584,33 +748,101 @@ export function App() {
     setStatus("Redid the last edit.");
   }, [busy, edits, redoStack]);
 
+  const commitAnnotations = useCallback((
+    next: AnnotationDocument,
+    message: string,
+    nextSelection: string | null = selectedAnnotationId,
+  ) => {
+    if (next === annotationHistory.present) {
+      setStatus("Nothing changed.");
+      return;
+    }
+    setAnnotationHistory(commitAnnotationHistory(annotationHistory, next));
+    setSelectedAnnotationId(nextSelection);
+    setDirty(true);
+    setStatus(message);
+  }, [annotationHistory, selectedAnnotationId]);
+
+  const undoAnnotationChange = useCallback(() => {
+    if (busy) return;
+    const next = undoAnnotationHistory(annotationHistory);
+    if (next === annotationHistory) return;
+    setAnnotationHistory(next);
+    setSelectedAnnotationId(null);
+    setDirty(true);
+    setStatus("Undid the last annotation change.");
+  }, [annotationHistory, busy]);
+
+  const redoAnnotationChange = useCallback(() => {
+    if (busy) return;
+    const next = redoAnnotationHistory(annotationHistory);
+    if (next === annotationHistory) return;
+    setAnnotationHistory(next);
+    setSelectedAnnotationId(null);
+    setDirty(true);
+    setStatus("Redid the annotation change.");
+  }, [annotationHistory, busy]);
+
+  const deleteSelectedAnnotation = useCallback(() => {
+    if (busy || !selectedAnnotationId) return;
+    const selected = findAnnotation(annotationHistory.present, selectedAnnotationId);
+    if (!selected) return;
+    commitAnnotations(
+      deleteAnnotations(annotationHistory.present, [selectedAnnotationId]),
+      `Deleted ${selected.label ?? "the selected annotation"}.`,
+      null,
+    );
+  }, [annotationHistory.present, busy, commitAnnotations, selectedAnnotationId]);
+
+  const duplicateSelectedAnnotation = useCallback(() => {
+    if (busy || !selectedAnnotationId || !currentPageId) return;
+    const duplicateId = createAnnotationId();
+    const next = duplicateAnnotations(
+      annotationHistory.present,
+      currentPageId,
+      [selectedAnnotationId],
+      () => duplicateId,
+    );
+    commitAnnotations(next, "Duplicated the selected annotation.", duplicateId);
+  }, [annotationHistory.present, busy, commitAnnotations, currentPageId, selectedAnnotationId]);
+
   const captureDocumentSnapshot = useCallback(async (
     current: PdfEngine,
     handle: OperationHandle,
   ): Promise<DocumentSnapshot> => ({
     bytes: await current.snapshotBytes(handle.options),
     edits: cloneEdits(edits),
+    annotations: cloneAnnotationDocument(annotationHistory.present),
     pageIds: [...pageIds],
     selectedPageIds: [...selectedPageIds],
     activePageId: pageIds[pageIndex] ?? pageIds[0] ?? "",
     fileName,
     fileSize,
     dirty,
-  }), [dirty, edits, fileName, fileSize, pageIds, pageIndex, selectedPageIds]);
+  }), [annotationHistory.present, dirty, edits, fileName, fileSize, pageIds, pageIndex, selectedPageIds]);
 
   const installDocument = useCallback((opened: PdfEngine, file: File) => {
+    const nextPageIds = createPageIds(opened.pageInfos.length);
     engineRef.current?.close();
     setEngine(opened);
     engineRef.current = opened;
     setFileName(file.name);
     setFileSize(file.size);
     setEdits(opened.pageInfos.map(() => ({ rotation: 0, crop: null })));
-    setPageIds(createPageIds(opened.pageInfos.length));
+    setPageIds(nextPageIds);
     setSelectedPageIds([]);
     setUndoStack([]);
     setRedoStack([]);
     setStructureUndoStack([]);
     setStructureRedoStack([]);
+    setAnnotationHistory(createAnnotationHistory(createAnnotationDocument(nextPageIds)));
+    setEditorMode("crop");
+    setAnnotationTool("select");
+    setSelectedAnnotationId(null);
+    setSignatureDrafts({ signature: null, initial: null });
+    setSignatureDialogKind(null);
+    setPendingSignaturePoint(null);
+    setTextDialogRequest(null);
     setPageIndex(0);
     setZoom(1);
     setAspectPreset("Free");
@@ -628,6 +860,9 @@ export function App() {
     addedEncryptedPdf: boolean,
     previousSnapshot: DocumentSnapshot,
   ) => {
+    const addedPageIds = createPageIds(addedPageCount);
+    const nextAnnotations = cloneAnnotationDocument(annotationHistory.present);
+    for (const pageId of addedPageIds) nextAnnotations.pages[pageId] = [];
     const previous = engineRef.current;
     setEngine(opened);
     engineRef.current = opened;
@@ -636,11 +871,13 @@ export function App() {
       ...cloneEdits(edits),
       ...Array.from({ length: addedPageCount }, () => ({ rotation: 0 as Rotation, crop: null })),
     ]);
-    setPageIds([...pageIds, ...createPageIds(addedPageCount)]);
+    setPageIds([...pageIds, ...addedPageIds]);
     setUndoStack([]);
     setRedoStack([]);
     setStructureUndoStack((history) => pushBoundedHistory(history, previousSnapshot));
     setStructureRedoStack([]);
+    setAnnotationHistory(resetAnnotationHistory(annotationHistory, nextAnnotations));
+    setSelectedAnnotationId(null);
     setFileName(combinedFileName(fileName));
     setFileSize(opened.byteLength);
     setDirty(true);
@@ -651,7 +888,7 @@ export function App() {
       ? " The combined copy uses the first PDF's password settings."
       : "";
     setStatus(`Added ${addedPageCount} page${addedPageCount === 1 ? "" : "s"} from ${fileCount} PDF${fileCount === 1 ? "" : "s"} locally. Existing page edits were kept, and this page change can be undone.${encryptionNote}`);
-  }, [edits, fileName, pageIds]);
+  }, [annotationHistory, edits, fileName, pageIds]);
 
   const openBytes = useCallback(
     async (
@@ -973,6 +1210,189 @@ export function App() {
     return visualPageDimensions(currentPage, totalRotation(currentPage, currentEdit.rotation));
   }, [currentEdit, currentPage]);
 
+  const annotationTransform = useMemo<AnnotationViewportTransform>(() => ({
+    rotation: currentPage && currentEdit
+      ? totalRotation(currentPage, currentEdit.rotation)
+      : 0,
+    crop: currentEdit?.crop ?? null,
+    sourceWidthPoints: currentPage?.sourceWidthPoints ?? 1,
+    sourceHeightPoints: currentPage?.sourceHeightPoints ?? 1,
+  }), [currentEdit, currentPage]);
+
+  const visibleAnnotationDimensions = useMemo<[number, number]>(() => [
+    Math.max(1, currentDimensions[0] * (visualCrop[2] - visualCrop[0])),
+    Math.max(1, currentDimensions[1] * (visualCrop[3] - visualCrop[1])),
+  ], [currentDimensions, visualCrop]);
+
+  const createPageAnnotation = useCallback((draft: NewAnnotation) => {
+    if (busy || !currentPageId) return;
+    const id = createAnnotationId();
+    const annotation = { ...draft, id, pageId: currentPageId } as Annotation;
+    try {
+      commitAnnotations(
+        addAnnotation(annotationHistory.present, annotation),
+        `Added ${annotation.label?.toLowerCase() ?? "an annotation"}.`,
+        id,
+      );
+      if (!["pen", "highlighter"].includes(annotationTool)) setAnnotationTool("select");
+    } catch (error) {
+      setStatus(`Could not add annotation: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [annotationHistory.present, annotationTool, busy, commitAnnotations, currentPageId]);
+
+  const changePageAnnotation = useCallback((annotation: Annotation) => {
+    if (busy) return;
+    try {
+      commitAnnotations(
+        updateAnnotation(annotationHistory.present, annotation.id, () => annotation),
+        `Updated ${annotation.label?.toLowerCase() ?? "the annotation"}.`,
+        annotation.id,
+      );
+    } catch (error) {
+      setStatus(`Could not update annotation: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [annotationHistory.present, busy, commitAnnotations]);
+
+  const deletePageAnnotation = useCallback((annotationId: string) => {
+    if (busy) return;
+    const annotation = findAnnotation(annotationHistory.present, annotationId);
+    if (!annotation) return;
+    commitAnnotations(
+      deleteAnnotations(annotationHistory.present, [annotationId]),
+      `Deleted ${annotation.label?.toLowerCase() ?? "the annotation"}.`,
+      selectedAnnotationId === annotationId ? null : selectedAnnotationId,
+    );
+  }, [annotationHistory.present, busy, commitAnnotations, selectedAnnotationId]);
+
+  const changeAnnotationStyle = useCallback((style: AnnotationStyle) => {
+    if (!selectedAnnotationId || annotationTool !== "select") {
+      const bucket = annotationTool === "highlighter" ? "highlighter" : "standard";
+      setAnnotationStyles((current) => ({ ...current, [bucket]: style }));
+    }
+    if (!selectedAnnotationId) return;
+    const selected = findAnnotation(annotationHistory.present, selectedAnnotationId);
+    if (!selected) return;
+    try {
+      commitAnnotations(
+        updateAnnotation(annotationHistory.present, selectedAnnotationId, (annotation) => ({
+          ...annotation,
+          color: style.color,
+          opacity: style.opacity,
+          width: style.width,
+        })),
+        `Updated ${selected.label?.toLowerCase() ?? "the annotation"} appearance.`,
+      );
+    } catch (error) {
+      setStatus(`Could not update appearance: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [annotationHistory.present, annotationTool, commitAnnotations, selectedAnnotationId]);
+
+  const placeTextAnnotation = useCallback((value: TextComposerValue) => {
+    if (!textDialogRequest) return;
+    const [visibleWidth, visibleHeight] = visibleAnnotationDimensions;
+    const desiredWidth = Math.min(260, Math.max(110, value.text.length * value.fontSize * 0.58));
+    const charactersPerLine = Math.max(1, Math.floor(desiredWidth / Math.max(value.fontSize * 0.58, 1)));
+    const lineCount = value.text.split(/\r?\n/).reduce(
+      (count, line) => count + Math.max(1, Math.ceil(line.length / charactersPerLine)),
+      0,
+    );
+    const desiredHeight = Math.max(30, lineCount * value.fontSize * 1.35);
+    const { source } = placementRect(
+      textDialogRequest.point,
+      desiredWidth,
+      desiredHeight,
+      annotationTransform,
+      visibleWidth,
+      visibleHeight,
+    );
+    createPageAnnotation({
+      kind: "text",
+      tool: textDialogRequest.tool,
+      rect: source,
+      text: value.text,
+      fontSize: value.fontSize,
+      fontFamily: value.fontFamily,
+      align: value.align,
+      ...activeAnnotationStyle,
+      label: textDialogRequest.tool === "date" ? "Date" : "Text",
+    });
+    setTextDialogRequest(null);
+  }, [activeAnnotationStyle, annotationTransform, createPageAnnotation, textDialogRequest, visibleAnnotationDimensions]);
+
+  const createSignatureAnnotation = useCallback((
+    draft: SignatureDraft,
+    sourcePoint: AnnotationPoint,
+  ) => {
+    const [visibleWidth, visibleHeight] = visibleAnnotationDimensions;
+    const widthPoints = draft.kind === "initial" ? 96 : 190;
+    const heightPoints = draft.kind === "initial" ? 52 : 74;
+    const placement = placementRect(
+      sourcePoint,
+      widthPoints,
+      heightPoints,
+      annotationTransform,
+      visibleWidth,
+      visibleHeight,
+    );
+    const label = draft.kind === "initial" ? "Visual initials" : "Visual signature";
+    if (draft.input === "draw") {
+      const strokes = draft.strokes.map((stroke) => stroke.map((point) => viewportPointToSource({
+        x: placement.viewport.x + placement.viewport.width * (0.04 + point.x * 0.92),
+        y: placement.viewport.y + placement.viewport.height * (0.04 + point.y * 0.92),
+        pressure: point.pressure,
+      }, annotationTransform)));
+      createPageAnnotation({
+        kind: "ink",
+        tool: draft.kind,
+        strokes,
+        ...activeAnnotationStyle,
+        width: Math.max(1.6, activeAnnotationStyle.width),
+        label,
+      });
+    } else {
+      createPageAnnotation({
+        kind: "text",
+        tool: draft.kind,
+        rect: placement.source,
+        text: draft.text,
+        fontSize: draft.kind === "initial" ? 20 : 27,
+        fontFamily: draft.fontFamily,
+        align: "center",
+        ...activeAnnotationStyle,
+        label,
+      });
+    }
+  }, [activeAnnotationStyle, annotationTransform, createPageAnnotation, visibleAnnotationDimensions]);
+
+  const prepareSignature = useCallback((kind: SignatureKind) => {
+    setAnnotationTool(kind);
+    setSelectedAnnotationId(null);
+    setPendingSignaturePoint(null);
+    setSignatureDialogKind(kind);
+  }, []);
+
+  const requestSignaturePlacement = useCallback((kind: SignatureKind, point: AnnotationPoint) => {
+    const draft = signatureDrafts[kind];
+    if (draft) {
+      createSignatureAnnotation(draft, point);
+      return;
+    }
+    setPendingSignaturePoint(point);
+    setSignatureDialogKind(kind);
+  }, [createSignatureAnnotation, signatureDrafts]);
+
+  const confirmSignatureDraft = useCallback((draft: SignatureDraft) => {
+    setSignatureDrafts((current) => ({ ...current, [draft.kind]: draft }));
+    setSignatureDialogKind(null);
+    if (pendingSignaturePoint) {
+      createSignatureAnnotation(draft, pendingSignaturePoint);
+      setPendingSignaturePoint(null);
+    } else {
+      setAnnotationTool(draft.kind);
+      setStatus(`Click the page to place your ${draft.kind === "initial" ? "initials" : "visual signature"}.`);
+    }
+  }, [createSignatureAnnotation, pendingSignaturePoint]);
+
   const aspectPhysical = useMemo(
     () => aspectRatioForPreset(aspectPreset, currentDimensions[0], currentDimensions[1]),
     [aspectPreset, currentDimensions],
@@ -1131,11 +1551,26 @@ export function App() {
         const reordered = await current.reorganize(pageOrder, handle.options);
         const nextEdits = pageOrder.map((index) => cloneEdits([edits[index]])[0]);
         const occurrences = new Map<number, number>();
+        let nextAnnotations = cloneAnnotationDocument(annotationHistory.present);
         const nextPageIds = pageOrder.map((index) => {
           const occurrence = occurrences.get(index) ?? 0;
           occurrences.set(index, occurrence + 1);
-          return occurrence === 0 ? pageIds[index] : createPageId();
+          if (occurrence === 0) return pageIds[index];
+          const duplicatedPageId = createPageId();
+          nextAnnotations = duplicatePageAnnotations(
+            nextAnnotations,
+            pageIds[index],
+            duplicatedPageId,
+            () => createAnnotationId(),
+          );
+          return duplicatedPageId;
         });
+        const retainedPageIds = new Set(nextPageIds);
+        for (const existingPageId of Object.keys(nextAnnotations.pages)) {
+          if (!retainedPageIds.has(existingPageId)) {
+            nextAnnotations = removeAnnotationPage(nextAnnotations, existingPageId);
+          }
+        }
         setEngine(reordered);
         engineRef.current = reordered;
         current.close();
@@ -1146,6 +1581,8 @@ export function App() {
         setZoom(1);
         setUndoStack([]);
         setRedoStack([]);
+        setAnnotationHistory(resetAnnotationHistory(annotationHistory, nextAnnotations));
+        setSelectedAnnotationId(null);
         setStructureUndoStack((history) => pushBoundedHistory(history, previousSnapshot));
         setStructureRedoStack([]);
         setFileSize(reordered.byteLength);
@@ -1160,7 +1597,7 @@ export function App() {
         endOperation(handle);
       }
     },
-    [beginOperation, busy, captureDocumentSnapshot, edits, endOperation, pageIds],
+    [annotationHistory, beginOperation, busy, captureDocumentSnapshot, edits, endOperation, pageIds],
   );
 
   const movePage = useCallback(
@@ -1250,6 +1687,8 @@ export function App() {
       setDirty(target.dirty);
       setUndoStack([]);
       setRedoStack([]);
+      setAnnotationHistory(resetAnnotationHistory(annotationHistory, target.annotations));
+      setSelectedAnnotationId(null);
       if (direction === "undo") {
         setStructureUndoStack((history) => history.slice(0, -1));
         setStructureRedoStack((history) => pushBoundedHistory(history, present));
@@ -1266,7 +1705,7 @@ export function App() {
       setBusy(false);
       endOperation(handle);
     }
-  }, [beginOperation, busy, captureDocumentSnapshot, endOperation, structureRedoStack, structureUndoStack]);
+  }, [annotationHistory, beginOperation, busy, captureDocumentSnapshot, endOperation, structureRedoStack, structureUndoStack]);
 
   const undoStructure = useCallback(() => void restoreStructure("undo"), [restoreStructure]);
   const redoStructure = useCallback(() => void restoreStructure("redo"), [restoreStructure]);
@@ -1317,7 +1756,10 @@ export function App() {
     const handle = beginOperation(`Extracting ${pageOrder.length} selected page${pageOrder.length === 1 ? "" : "s"} locally…`);
     setStatus(`Extracting ${pageOrder.length} selected page${pageOrder.length === 1 ? "" : "s"} locally…`);
     try {
-      const bytes = await current.exportPdf(edits, pageOrder, handle.options);
+      const bytes = await current.exportPdf(edits, pageOrder, {
+        ...handle.options,
+        annotations: exportAnnotations,
+      });
       const baseName = fileName.replace(/\.pdf$/i, "") || "document";
       const contiguous = pageOrder.every((value, index) => index === 0 || value === pageOrder[index - 1] + 1);
       const suffix = contiguous
@@ -1334,7 +1776,7 @@ export function App() {
       setBusy(false);
       endOperation(handle);
     }
-  }, [beginOperation, busy, edits, endOperation, fileName, pageIds, selectedPageIds]);
+  }, [beginOperation, busy, edits, endOperation, exportAnnotations, fileName, pageIds, selectedPageIds]);
 
   const splitPdf = useCallback(async (request: SplitRequest) => {
     const current = engineRef.current;
@@ -1375,6 +1817,7 @@ export function App() {
         );
         const bytes = await current.exportPdf(edits, group.pageIndices, {
           signal: handle.controller.signal,
+          annotations: exportAnnotations,
           onProgress: (progress) => {
             const fraction = progress.total > 0 ? progress.completed / progress.total : 0;
             updateOperation(
@@ -1422,7 +1865,7 @@ export function App() {
       setBusy(false);
       endOperation(handle);
     }
-  }, [beginOperation, busy, edits, endOperation, fileName, updateOperation]);
+  }, [beginOperation, busy, edits, endOperation, exportAnnotations, fileName, updateOperation]);
 
   const downloadPdf = useCallback(async () => {
     if (!engine || busy) return;
@@ -1430,7 +1873,10 @@ export function App() {
     const handle = beginOperation("Building and verifying your edited PDF…");
     setStatus("Building and verifying your edited PDF…");
     try {
-      const bytes = await engine.exportPdf(edits, undefined, handle.options);
+      const bytes = await engine.exportPdf(edits, undefined, {
+        ...handle.options,
+        annotations: exportAnnotations,
+      });
       const baseName = fileName.replace(/\.pdf$/i, "") || "document";
       const downloadName = `${baseName}-edited.pdf`;
       downloadPdfBytes(bytes, downloadName);
@@ -1443,7 +1889,7 @@ export function App() {
       setBusy(false);
       endOperation(handle);
     }
-  }, [beginOperation, busy, edits, endOperation, engine, fileName]);
+  }, [beginOperation, busy, edits, endOperation, engine, exportAnnotations, fileName]);
 
   useEffect(() => {
     const keyHandler = (event: KeyboardEvent) => {
@@ -1459,11 +1905,15 @@ export function App() {
         return;
       } else if (command && event.key.toLowerCase() === "z") {
         event.preventDefault();
-        if (event.shiftKey) redo();
+        if (editorMode === "annotate") {
+          if (event.shiftKey) redoAnnotationChange();
+          else undoAnnotationChange();
+        } else if (event.shiftKey) redo();
         else undo();
       } else if (command && event.key.toLowerCase() === "y") {
         event.preventDefault();
-        redo();
+        if (editorMode === "annotate") redoAnnotationChange();
+        else redo();
       } else if (command && event.key === "0") {
         event.preventDefault();
         setZoom(1);
@@ -1490,7 +1940,7 @@ export function App() {
     };
     window.addEventListener("keydown", keyHandler);
     return () => window.removeEventListener("keydown", keyHandler);
-  }, [chooseFile, downloadPdf, engine, modalOpen, pages.length, redo, rotateCurrent, undo]);
+  }, [chooseFile, downloadPdf, editorMode, engine, modalOpen, pages.length, redo, redoAnnotationChange, rotateCurrent, undo, undoAnnotationChange]);
 
   const submitPassword = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -1632,10 +2082,22 @@ export function App() {
               </button>
             )}
           </div>
-          <button type="button" className="icon-button" aria-label="Undo" disabled={!undoStack.length || busy} onClick={undo}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={editorMode === "annotate" ? "Undo annotation change" : "Undo crop or rotation change"}
+            disabled={busy || (editorMode === "annotate" ? !canUndoAnnotations(annotationHistory) : !undoStack.length)}
+            onClick={editorMode === "annotate" ? undoAnnotationChange : undo}
+          >
             <Undo2 size={18} />
           </button>
-          <button type="button" className="icon-button" aria-label="Redo" disabled={!redoStack.length || busy} onClick={redo}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={editorMode === "annotate" ? "Redo annotation change" : "Redo crop or rotation change"}
+            disabled={busy || (editorMode === "annotate" ? !canRedoAnnotations(annotationHistory) : !redoStack.length)}
+            onClick={editorMode === "annotate" ? redoAnnotationChange : redo}
+          >
             <Redo2 size={18} />
           </button>
           <button
@@ -1703,40 +2165,80 @@ export function App() {
             normalizedAspect={aspectNormalized}
             zoom={zoom}
             busy={busy}
+            editorMode={editorMode}
+            annotations={currentAnnotations}
+            annotationTool={annotationTool}
+            annotationStyle={activeAnnotationStyle}
+            selectedAnnotationId={selectedAnnotationId}
             onZoomChange={setZoom}
+            onEditorModeChange={(mode) => {
+              setEditorMode(mode);
+              setSelectedAnnotationId(null);
+              setStatus(mode === "annotate"
+                ? "Annotate mode ready. Choose a tool, then work directly on the page."
+                : "Crop and rotate mode ready.");
+            }}
             onCropCommit={cropCurrentPage}
             onCropReset={resetCrop}
+            onAnnotationSelect={setSelectedAnnotationId}
+            onAnnotationCreate={createPageAnnotation}
+            onAnnotationUpdate={changePageAnnotation}
+            onAnnotationDelete={deletePageAnnotation}
+            onRequestText={(tool, point) => setTextDialogRequest({ tool, point })}
+            onPlaceSignature={requestSignaturePlacement}
             onPageChange={(index) => {
               setPageIndex(index);
               setZoom(1);
             }}
             onStatus={setStatus}
           />
-          <Inspector
-            pageInfo={currentPage}
-            pageEdit={currentEdit}
-            visualCrop={visualCrop}
-            aspectPreset={aspectPreset}
-            aspectLocked={aspectLocked}
-            canUndo={undoStack.length > 0}
-            canRedo={redoStack.length > 0}
-            busy={busy}
-            onAspectPresetChange={(preset) => {
-              setAspectPreset(preset);
-              if (preset === "Free") setAspectLocked(false);
-            }}
-            onAspectLockedChange={setAspectLocked}
-            onRotate={rotateCurrent}
-            onResetRotation={resetRotation}
-            onCropCommit={cropCurrentPage}
-            onResetCrop={resetCrop}
-            onUndo={undo}
-            onRedo={redo}
-            onFitAspect={fitAspect}
-            onAutoTrim={autoTrim}
-            onBatchApply={applyBatch}
-            onStatus={setStatus}
-          />
+          {editorMode === "crop" ? (
+            <Inspector
+              pageInfo={currentPage}
+              pageEdit={currentEdit}
+              visualCrop={visualCrop}
+              aspectPreset={aspectPreset}
+              aspectLocked={aspectLocked}
+              canUndo={undoStack.length > 0}
+              canRedo={redoStack.length > 0}
+              busy={busy}
+              onAspectPresetChange={(preset) => {
+                setAspectPreset(preset);
+                if (preset === "Free") setAspectLocked(false);
+              }}
+              onAspectLockedChange={setAspectLocked}
+              onRotate={rotateCurrent}
+              onResetRotation={resetRotation}
+              onCropCommit={cropCurrentPage}
+              onResetCrop={resetCrop}
+              onUndo={undo}
+              onRedo={redo}
+              onFitAspect={fitAspect}
+              onAutoTrim={autoTrim}
+              onBatchApply={applyBatch}
+              onStatus={setStatus}
+            />
+          ) : (
+            <AnnotationToolbar
+              pageNumber={pageIndex + 1}
+              activeTool={annotationTool}
+              style={activeAnnotationStyle}
+              busy={busy}
+              hasSelection={selectedAnnotationId !== null}
+              canUndo={canUndoAnnotations(annotationHistory)}
+              canRedo={canRedoAnnotations(annotationHistory)}
+              onToolChange={(tool) => {
+                setAnnotationTool(tool);
+                if (tool !== "select") setSelectedAnnotationId(null);
+              }}
+              onPrepareSignature={prepareSignature}
+              onStyleChange={changeAnnotationStyle}
+              onUndo={undoAnnotationChange}
+              onRedo={redoAnnotationChange}
+              onDuplicate={duplicateSelectedAnnotation}
+              onDelete={deleteSelectedAnnotation}
+            />
+          )}
         </main>
       ) : (
         <main className="empty-state">
@@ -1744,8 +2246,8 @@ export function App() {
           <div className="empty-card">
             <div className="empty-icon"><UploadCloud size={30} /></div>
             <span className="eyebrow">No uploads. No account.</span>
-            <h1>Crop, rotate, and organize PDFs,<br />privately in your browser.</h1>
-            <p>Crop, rotate, split, merge, reorder, duplicate, extract, and batch-edit PDF pages locally with a live preview. No file upload, account, or server-side document storage.</p>
+            <h1>Crop, rotate, annotate, and sign PDFs,<br />privately in your browser.</h1>
+            <p>Crop, rotate, draw, highlight, add text or a visual signature, split, merge, and organize PDF pages locally with a live preview. No file upload, account, or server-side document storage.</p>
             <button
               type="button"
               className="primary-hero-button"
@@ -1767,7 +2269,7 @@ export function App() {
             </button>
           </div>
           <div className="feature-strip" aria-label="Main features">
-            <span><Sparkles size={16} /> Live precision crop</span>
+            <span><Sparkles size={16} /> Crop, draw &amp; visually sign</span>
             <span><Files size={16} /> Merge, split &amp; organize</span>
             <span><ShieldCheck size={16} /> Local &amp; offline-ready</span>
           </div>
@@ -1828,6 +2330,32 @@ export function App() {
         />
       )}
 
+      <SignatureDialog
+        open={signatureDialogKind !== null}
+        kind={signatureDialogKind ?? "signature"}
+        busy={busy}
+        initialValue={signatureDialogKind ? signatureDrafts[signatureDialogKind] : null}
+        onCancel={() => {
+          setSignatureDialogKind(null);
+          setPendingSignaturePoint(null);
+          setAnnotationTool("select");
+          setStatus("Signature placement cancelled.");
+        }}
+        onConfirm={confirmSignatureDraft}
+      />
+
+      <TextAnnotationDialog
+        open={textDialogRequest !== null}
+        tool={textDialogRequest?.tool ?? "text"}
+        busy={busy}
+        onCancel={() => {
+          setTextDialogRequest(null);
+          setAnnotationTool("select");
+          setStatus("Text placement cancelled.");
+        }}
+        onConfirm={placeTextAnnotation}
+      />
+
       {pendingPassword && (
         <div className="modal-backdrop" role="presentation">
           <form
@@ -1879,10 +2407,11 @@ export function App() {
             <button type="button" className="modal-close" aria-label="Close" autoFocus onClick={closeAbout}><X size={18} /></button>
             <div className="modal-icon"><FileText size={22} /></div>
             <h2 id="about-title">CropRotate PDF</h2>
-            <p>A private, open-source PDF crop, rotation, and page-organization tool. Documents are processed in this browser tab with MuPDF WebAssembly.</p>
+            <p>A private, open-source PDF crop, rotation, annotation, visual-signature, and page-organization tool. Documents are processed in this browser tab with MuPDF WebAssembly.</p>
             <ul>
               <li>No document uploads, accounts, or analytics</li>
               <li>Non-destructive CropBox editing</li>
+              <li>Local drawing, highlighting, text, dates, marks, shapes, and visual signatures</li>
               <li>Local PDF merging, splitting, duplication, reordering, removal, and extraction</li>
               <li>Installable app shell for offline use after the first visit</li>
               <li>AGPL-3.0-or-later licensed</li>
@@ -1920,10 +2449,11 @@ export function App() {
             <h2 id="privacy-title">Privacy &amp; data ownership</h2>
             <p id="privacy-summary"><strong>Private by design.</strong> Your PDFs and passwords are processed only in this browser tab. This app does not upload them or store a server-side copy. Edits are temporary until you download the result; closing or reloading the tab discards the working session.</p>
             <ul className="privacy-list">
-              <li>PDF bytes, previews, passwords, page organization, edits, and undo history remain in this tab's memory during the working session.</li>
+              <li>PDF bytes, previews, passwords, page organization, crop settings, annotations, visual signature templates, and undo history remain in this tab's memory during the working session.</li>
               <li>The app uses no cookies, local storage, browser database, analytics, or server database to store your documents or editing data.</li>
               <li>Only choosing <strong>Save local copy</strong>, <strong>Extract selected</strong>, or <strong>Split to ZIP</strong> requests an output download through your browser.</li>
               <li>Cropping changes the PDF's visible page box; it is not redaction and does not erase hidden content outside the crop.</li>
+              <li>Visual signatures and initials are flattened marks for appearance only; they are not certificate-backed, identity-verified cryptographic digital signatures.</li>
               <li>The app is not a malware scanner or PDF sanitizer; active content and attachments may remain in exported files.</li>
               <li>GitHub Pages receives ordinary web-request metadata. For offline use, the service worker caches only the app's static code—not your PDFs, previews, edits, passwords, or output files.</li>
               <li>Browser extensions, operating-system memory handling, and cloud-synced download folders are outside this app's control.</li>

@@ -2,7 +2,7 @@
   "id": "./",
   "name": "CropRotate PDF",
   "short_name": "CropRotate",
-  "description": "Crop, rotate, split, merge and organize PDF pages privately in your browser.",
+  "description": "Annotate, visually sign, crop, rotate, split, merge and organize PDFs privately in your browser.",
   "lang": "en",
   "dir": "ltr",
   "start_url": "./",

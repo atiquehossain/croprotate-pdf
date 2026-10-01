@@ -1,12 +1,16 @@
 # CropRotate PDF
 
-**Crop, rotate, merge and organize PDFs privately — this app does not upload your documents.**
+**Annotate, visually sign, crop, rotate, merge and organize PDFs privately — this app does not upload your documents.**
 
-CropRotate PDF is a free, browser-based PDF editor with live previews, precise crop and rotation controls, auto-trim, batch editing, splitting, and a visual page organizer. It is a static web app: selected PDFs are processed in a dedicated worker inside the current browser tab, with no document upload API, account, analytics, or server-side document copy.
+CropRotate PDF is a free, browser-based PDF annotator and editor with visual signing, live previews, precise crop and rotation controls, auto-trim, batch editing, splitting, and a visual page organizer. It is a static web app: selected PDFs, annotations, and visual signatures are processed in a dedicated worker inside the current browser tab, with no document upload API, account, analytics, or server-side document copy.
 
 ## Features
 
 - Live PDF preview with page thumbnails, zoom, pan, and page navigation
+- Pen and highlighter drawing with adjustable color, width, and opacity
+- Text and date placement plus check, cross, line, arrow, rectangle, and ellipse tools
+- Drawn or typed visual signatures and initials, with move, resize, duplicate, and delete controls
+- Annotation-specific undo and redo
 - Rotate individual pages left or right
 - Draw, move, and resize crops with eight handles and a rule-of-thirds guide
 - Exact top/right/bottom/left margins in percent, points, millimetres, or inches
@@ -28,6 +32,10 @@ CropRotate PDF is a free, browser-based PDF editor with live previews, precise c
 
 Crop and rotation history is separate from page-structure history. Merging, moving, duplicating, or removing pages keeps edits attached to the correct pages and creates a bounded, in-memory structural undo point. History is discarded when the tab closes or reloads.
 
+Annotations created in CropRotate PDF are flattened into page content when a PDF is exported, while annotations already present in the original PDF are preserved as separate PDF annotations. A drawn or typed signature or set of initials is only a visual electronic mark: it is not certificate-backed, identity-verified, or a cryptographic digital signature. Editing or exporting can invalidate a digital signature already present in a PDF; keep the original when signature validation matters.
+
+Typed text, dates, signatures, and initials use built-in PDF fonts. If those fonts cannot encode a character, export stops with guidance instead of silently losing glyphs. Use the pen or a drawn signature for unsupported scripts or characters.
+
 Combined PDFs use the first PDF's encryption, open password, and permission settings. The app blocks a merge when the first PDF's settings would remove another PDF's encryption or required open password; open that protected PDF first. It cannot compare password strength or encryption algorithms, and settings from additional PDFs are not carried into the combined file.
 
 PDF cropping changes each page's PDF `CropBox`; it does not reliably erase content outside the visible crop. Editing or reorganizing pages can invalidate existing digital signatures. Structural edits rebuild the working PDF, and document-level features such as bookmarks, attachments, page labels, JavaScript, or some form structures—especially from added PDFs—may not carry over. Keep the originals, and use a dedicated redaction tool when content must be permanently removed.
@@ -36,7 +44,7 @@ CropRotate PDF is an editor, not a malware scanner or PDF sanitizer. Active cont
 
 ## Privacy model
 
-PDF bytes, rendered previews, passwords, edits, selections, and undo history are held only in the current browser tab's memory while the app is open. Merging, splitting, duplication, reordering, removal, and extraction also happen locally in memory. CropRotate PDF does not upload those files or details, write them to browser storage, or keep a server-side copy. Reloading or closing the tab discards the working session. A new output file is saved only when the user explicitly downloads it; original files are not changed.
+PDF bytes, rendered previews, passwords, edits, annotations, visual signatures and initials, selections, and undo history are held only in the current browser tab's memory while the app is open. Merging, splitting, duplication, reordering, removal, extraction, annotation, and export also happen locally in memory. CropRotate PDF does not upload those files or details, write them to browser storage, run analytics, or keep a server-side copy. Reloading or closing the tab discards the working session. A new output file is saved only when the user explicitly downloads it; original files are not changed.
 
 The user keeps ownership and control of opened documents and created outputs. The app does not claim rights to either.
 

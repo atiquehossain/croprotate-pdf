@@ -171,7 +171,10 @@ async function runRequest(
       const bytes = await requireDocument(request.payload.documentId).exportPdf(
         request.payload.edits,
         request.payload.pageOrder,
-        options,
+        {
+          ...options,
+          annotations: request.payload.annotations,
+        },
       );
       return { value: bytes, transfer: [bytes.buffer] };
     }

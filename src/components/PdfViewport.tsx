@@ -1,10 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type {
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 import { Minus, Plus, Scan } from "lucide-react";
 import type { PageEdit, PageInfo, VisualRect } from "../types";
 import type { PdfWorkerDocument } from "../pdf/workerClient";
 import { totalRotation, visualPageDimensions } from "../pdf/geometry";
+import type {
+  Annotation,
+  AnnotationStyle,
+  AnnotationTool,
+  AnnotationViewportTransform,
+} from "../annotations";
 import { CropOverlay } from "./CropOverlay";
+import { AnnotationOverlay, type NewAnnotation } from "./annotations";
 
 interface PdfViewportProps {
   engine: PdfWorkerDocument;
@@ -16,9 +26,21 @@ interface PdfViewportProps {
   normalizedAspect: number | null;
   zoom: number;
   busy: boolean;
+  editorMode: "crop" | "annotate";
+  annotations: readonly Annotation[];
+  annotationTool: AnnotationTool;
+  annotationStyle: AnnotationStyle;
+  selectedAnnotationId: string | null;
   onZoomChange: (zoom: number) => void;
+  onEditorModeChange: (mode: "crop" | "annotate") => void;
   onCropCommit: (rect: VisualRect) => void;
   onCropReset: () => void;
+  onAnnotationSelect: (annotationId: string | null) => void;
+  onAnnotationCreate: (annotation: NewAnnotation) => void;
+  onAnnotationUpdate: (annotation: Annotation) => void;
+  onAnnotationDelete: (annotationId: string) => void;
+  onRequestText: (tool: "text" | "date", sourcePoint: { x: number; y: number }) => void;
+  onPlaceSignature: (kind: "signature" | "initial", sourcePoint: { x: number; y: number }) => void;
   onPageChange: (index: number) => void;
   onStatus: (message: string) => void;
 }
@@ -49,9 +71,21 @@ export function PdfViewport({
   normalizedAspect,
   zoom,
   busy,
+  editorMode,
+  annotations,
+  annotationTool,
+  annotationStyle,
+  selectedAnnotationId,
   onZoomChange,
+  onEditorModeChange,
   onCropCommit,
   onCropReset,
+  onAnnotationSelect,
+  onAnnotationCreate,
+  onAnnotationUpdate,
+  onAnnotationDelete,
+  onRequestText,
+  onPlaceSignature,
   onPageChange,
   onStatus,
 }: PdfViewportProps) {
@@ -75,17 +109,31 @@ export function PdfViewport({
     () => visualPageDimensions(pageInfo, rotation),
     [pageInfo, rotation],
   );
+  const visibleWidthPoints = editorMode === "annotate"
+    ? pageWidthPoints * Math.max(visualCrop[2] - visualCrop[0], 0.0001)
+    : pageWidthPoints;
+  const visibleHeightPoints = editorMode === "annotate"
+    ? pageHeightPoints * Math.max(visualCrop[3] - visualCrop[1], 0.0001)
+    : pageHeightPoints;
   const fitScale = Math.max(
     0.05,
     Math.min(
-      Math.max(size.width - 72, 160) / pageWidthPoints,
-      Math.max(size.height - 112, 160) / pageHeightPoints,
+      Math.max(size.width - 72, 160) / visibleWidthPoints,
+      Math.max(size.height - 112, 160) / visibleHeightPoints,
       2.5,
     ),
   );
   const cssScale = fitScale * zoom;
-  const cssWidth = pageWidthPoints * cssScale;
-  const cssHeight = pageHeightPoints * cssScale;
+  const fullCssWidth = pageWidthPoints * cssScale;
+  const fullCssHeight = pageHeightPoints * cssScale;
+  const cssWidth = visibleWidthPoints * cssScale;
+  const cssHeight = visibleHeightPoints * cssScale;
+  const annotationTransform: AnnotationViewportTransform = {
+    rotation,
+    crop: pageEdit.crop,
+    sourceWidthPoints: pageInfo.sourceWidthPoints,
+    sourceHeightPoints: pageInfo.sourceHeightPoints,
+  };
 
   useEffect(() => {
     const element = shellRef.current;
@@ -204,6 +252,17 @@ export function PdfViewport({
     if (panRef.current?.pointerId === event.pointerId) panRef.current = null;
   };
 
+  const changeModeWithKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const mode = event.key === "ArrowLeft" || event.key === "Home" ? "crop" : "annotate";
+    onEditorModeChange(mode);
+    const target = event.currentTarget.parentElement?.querySelector<HTMLButtonElement>(
+      `[data-editor-mode="${mode}"]`,
+    );
+    window.requestAnimationFrame(() => target?.focus());
+  };
+
   const cancelToken = `${pageIndex}:${pageEdit.rotation}:${Math.round(cssWidth)}:${Math.round(cssHeight)}`;
 
   return (
@@ -232,7 +291,37 @@ export function PdfViewport({
             ›
           </button>
         </div>
-        <span className="viewer-hint">Drag to crop · inside moves · handles resize</span>
+        <div className="editor-mode-switch" role="tablist" aria-label="Editing mode">
+          <button
+            type="button"
+            role="tab"
+            data-editor-mode="crop"
+            data-short-label="Crop"
+            aria-selected={editorMode === "crop"}
+            tabIndex={editorMode === "crop" ? 0 : -1}
+            className={editorMode === "crop" ? "is-active" : ""}
+            onClick={() => onEditorModeChange("crop")}
+            onKeyDown={changeModeWithKeyboard}
+          >
+            Crop &amp; rotate
+          </button>
+          <button
+            type="button"
+            role="tab"
+            data-editor-mode="annotate"
+            data-short-label="Annotate"
+            aria-selected={editorMode === "annotate"}
+            tabIndex={editorMode === "annotate" ? 0 : -1}
+            className={editorMode === "annotate" ? "is-active" : ""}
+            onClick={() => onEditorModeChange("annotate")}
+            onKeyDown={changeModeWithKeyboard}
+          >
+            Annotate &amp; sign
+          </button>
+        </div>
+        <span className="viewer-hint">
+          {editorMode === "crop" ? "Drag to crop · handles resize" : "Choose a tool, then work directly on the page"}
+        </span>
         <div className="zoom-controls" aria-label="Zoom controls">
           <button
             type="button"
@@ -284,10 +373,17 @@ export function PdfViewport({
             <canvas
               ref={canvasRef}
               className="page-canvas"
-              style={{ width: `${cssWidth}px`, height: `${cssHeight}px` }}
+              style={{
+                width: `${fullCssWidth}px`,
+                height: `${fullCssHeight}px`,
+                left: editorMode === "annotate" ? `${-visualCrop[0] * fullCssWidth}px` : "0",
+                top: editorMode === "annotate" ? `${-visualCrop[1] * fullCssHeight}px` : "0",
+                right: "auto",
+                bottom: "auto",
+              }}
               aria-label={`Rendered preview of page ${pageIndex + 1}`}
             />
-            {!renderError && (
+            {!renderError && editorMode === "crop" && (
               <CropOverlay
                 rect={visualCrop}
                 hasCrop={pageEdit.crop !== null}
@@ -298,6 +394,27 @@ export function PdfViewport({
                 disabled={busy || rendering}
                 onCommit={onCropCommit}
                 onReset={onCropReset}
+                onStatus={onStatus}
+              />
+            )}
+            {!renderError && editorMode === "annotate" && (
+              <AnnotationOverlay
+                annotations={annotations}
+                activeTool={annotationTool}
+                style={annotationStyle}
+                transform={annotationTransform}
+                viewportWidth={cssWidth}
+                viewportHeight={cssHeight}
+                pageScale={cssScale}
+                selectedId={selectedAnnotationId}
+                cancelToken={`${cancelToken}:${editorMode}:${annotationTool}`}
+                disabled={busy || rendering}
+                onSelect={onAnnotationSelect}
+                onCreate={onAnnotationCreate}
+                onUpdate={onAnnotationUpdate}
+                onDelete={onAnnotationDelete}
+                onRequestText={onRequestText}
+                onPlaceSignature={onPlaceSignature}
                 onStatus={onStatus}
               />
             )}
@@ -314,7 +431,7 @@ export function PdfViewport({
       <div className="viewer-footer">
         <span>Ctrl/⌘ + wheel zooms</span>
         <span>Space or middle-drag pans</span>
-        <span>Arrow keys nudge crop</span>
+        <span>{editorMode === "crop" ? "Arrow keys nudge crop" : "Select an item to move or resize it"}</span>
       </div>
     </section>
   );
