@@ -15,6 +15,49 @@ const MAX_RENDER_PIXELS = 5_000_000;
 const MAX_USER_UNIT = 75_000;
 const MAX_PAGE_COUNT = 1_000;
 
+export interface PdfEngineProgress {
+  stage: string;
+  completed: number;
+  total: number;
+}
+
+/**
+ * Optional operation hooks used by the worker host. Existing callers can omit
+ * this argument, so the direct engine API remains backwards compatible.
+ */
+export interface PdfEngineOperationOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: PdfEngineProgress) => void;
+}
+
+function abortError(): Error {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException("The PDF operation was cancelled.", "AbortError");
+  }
+  const error = new Error("The PDF operation was cancelled.");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function reportProgress(
+  options: PdfEngineOperationOptions | undefined,
+  stage: string,
+  completed: number,
+  total: number,
+): void {
+  options?.onProgress?.({ stage, completed, total });
+}
+
+async function yieldForCancellation(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+  throwIfAborted(signal);
+}
+
 export class PasswordRequiredError extends Error {
   readonly incorrect: boolean;
 
@@ -41,6 +84,31 @@ export class PdfEngine {
     return this.originalBytes.byteLength;
   }
 
+  /**
+   * Returns a detached copy of the exact bytes backing this engine. This is
+   * useful for bounded structural undo stacks without keeping extra MuPDF
+   * documents alive. Password protection, if present, remains intact.
+   */
+  snapshotBytes(): Uint8Array<ArrayBuffer> {
+    return this.originalBytes.slice();
+  }
+
+  /**
+   * Reopens a previously captured snapshot with this engine's retained
+   * password. Callers never need to keep a plaintext PDF password solely for
+   * structural undo/redo. The protection level is verified before returning.
+   */
+  async restoreSnapshot(
+    bytes: Uint8Array,
+    options?: PdfEngineOperationOptions,
+  ): Promise<PdfEngine> {
+    throwIfAborted(options?.signal);
+    reportProgress(options, "restoring", 0, 1);
+    const restored = await this.openDerivedDocument(bytes, options);
+    reportProgress(options, "ready", 1, 1);
+    return restored;
+  }
+
   private constructor(
     document: mupdf.PDFDocument,
     bytes: Uint8Array,
@@ -59,8 +127,14 @@ export class PdfEngine {
     this.pageInfos = this.readPageInfos();
   }
 
-  static async open(bytes: Uint8Array, password?: string): Promise<PdfEngine> {
-    await Promise.resolve();
+  static async open(
+    bytes: Uint8Array,
+    password?: string,
+    options?: PdfEngineOperationOptions,
+  ): Promise<PdfEngine> {
+    throwIfAborted(options?.signal);
+    reportProgress(options, "opening", 0, 1);
+    await yieldForCancellation(options?.signal);
     let document: mupdf.PDFDocument;
     try {
       document = new mupdf.PDFDocument(bytes);
@@ -91,13 +165,16 @@ export class PdfEngine {
       if (pageCount > MAX_PAGE_COUNT) {
         throw new Error(`This PDF has more than the ${MAX_PAGE_COUNT.toLocaleString()}-page safety limit.`);
       }
-      return new PdfEngine(
+      const engine = new PdfEngine(
         document,
         bytes,
         encrypted ? password ?? "" : null,
         encrypted,
         passwordRequired,
       );
+      throwIfAborted(options?.signal);
+      reportProgress(options, "ready", 1, 1);
+      return engine;
     } catch (error) {
       document.destroy();
       throw error;
@@ -113,7 +190,10 @@ export class PdfEngine {
     editRotation: Rotation,
     scale: number,
     includeAnnotations = true,
+    options?: PdfEngineOperationOptions,
   ): RenderedPage {
+    throwIfAborted(options?.signal);
+    reportProgress(options, "rendering", 0, 1);
     const page = this.document.loadPage(pageIndex);
     try {
       const bounds = page.getBounds("CropBox");
@@ -148,11 +228,14 @@ export class PdfEngine {
         "CropBox",
       );
       try {
-        return {
+        const rendered = {
           width: pixmap.getWidth(),
           height: pixmap.getHeight(),
           pixels: new Uint8ClampedArray(pixmap.getPixels()),
         };
+        throwIfAborted(options?.signal);
+        reportProgress(options, "ready", 1, 1);
+        return rendered;
       } finally {
         pixmap.destroy();
       }
@@ -167,14 +250,19 @@ export class PdfEngine {
     sensitivity: TrimSensitivity,
     paddingPoints: number,
     includeAnnotations: boolean,
+    options?: PdfEngineOperationOptions,
   ): Promise<VisualRect | null> {
+    throwIfAborted(options?.signal);
+    reportProgress(options, "rendering", 0, 2);
     const info = this.pageInfos[pageIndex];
     const [pageWidth, pageHeight] = visualPageDimensions(
       info,
       totalRotation(info, editRotation),
     );
     const scale = Math.min(2, 1200 / Math.max(pageWidth, pageHeight));
-    const rendered = this.renderPage(pageIndex, editRotation, scale, includeAnnotations);
+    const rendered = this.renderPage(pageIndex, editRotation, scale, includeAnnotations, {
+      signal: options?.signal,
+    });
     const tolerance = {
       "Faint text": 7,
       Balanced: 14,
@@ -184,11 +272,19 @@ export class PdfEngine {
       type: "module",
     });
     const buffer = rendered.pixels.buffer;
+    reportProgress(options, "analyzing", 1, 2);
     return new Promise<VisualRect | null>((resolve, reject) => {
+      const handleAbort = () => {
+        globalThis.clearTimeout(timeout);
+        worker.terminate();
+        reject(abortError());
+      };
       const timeout = globalThis.setTimeout(() => {
+        options?.signal?.removeEventListener("abort", handleAbort);
         worker.terminate();
         reject(new Error("Auto-trim took too long and was cancelled."));
       }, 30_000);
+      options?.signal?.addEventListener("abort", handleAbort, { once: true });
       worker.onmessage = (
         event: MessageEvent<
           | { ok: true; rect: VisualRect | null }
@@ -196,12 +292,17 @@ export class PdfEngine {
         >,
       ) => {
         globalThis.clearTimeout(timeout);
+        options?.signal?.removeEventListener("abort", handleAbort);
         worker.terminate();
-        if (event.data.ok) resolve(event.data.rect);
+        if (event.data.ok) {
+          reportProgress(options, "ready", 2, 2);
+          resolve(event.data.rect);
+        }
         else reject(new Error(event.data.error));
       };
       worker.onerror = (event) => {
         globalThis.clearTimeout(timeout);
+        options?.signal?.removeEventListener("abort", handleAbort);
         worker.terminate();
         reject(new Error(event.message || "Auto-trim worker failed."));
       };
@@ -218,7 +319,10 @@ export class PdfEngine {
     });
   }
 
-  async append(others: readonly PdfEngine[]): Promise<PdfEngine> {
+  async append(
+    others: readonly PdfEngine[],
+    options?: PdfEngineOperationOptions,
+  ): Promise<PdfEngine> {
     if (!others.length) throw new Error("Choose at least one PDF to add.");
     if (!this.canAssemble) {
       throw new Error("The open PDF does not allow page assembly.");
@@ -239,41 +343,62 @@ export class PdfEngine {
     if (combinedPageCount > MAX_PAGE_COUNT) {
       throw new Error(`The combined PDF would exceed the ${MAX_PAGE_COUNT.toLocaleString()}-page safety limit.`);
     }
-    await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 20));
+    throwIfAborted(options?.signal);
+    const totalPagesToGraft = others.reduce((total, engine) => total + engine.pageInfos.length, 0);
+    reportProgress(options, "copying-pages", 0, totalPagesToGraft + 1);
+    await yieldForCancellation(options?.signal);
     const outputDocument = this.openOriginalDocument();
     let outputBuffer: mupdf.Buffer | null = null;
     let bytes: Uint8Array;
     try {
+      let completedPages = 0;
       for (const source of others) {
         const graftMap = outputDocument.newGraftMap();
         try {
           for (let index = 0; index < source.pageInfos.length; index += 1) {
+            throwIfAborted(options?.signal);
             graftMap.graftPage(-1, source.document, index);
+            completedPages += 1;
+            reportProgress(options, "copying-pages", completedPages, totalPagesToGraft + 1);
+            await yieldForCancellation(options?.signal);
           }
         } finally {
           graftMap.destroy();
         }
       }
+      throwIfAborted(options?.signal);
+      reportProgress(options, "saving", totalPagesToGraft, totalPagesToGraft + 1);
       outputBuffer = outputDocument.saveToBuffer(
         "garbage=2,compress,encrypt=keep",
       );
       bytes = outputBuffer.asUint8Array().slice();
+      throwIfAborted(options?.signal);
     } finally {
       outputBuffer?.destroy();
       outputDocument.destroy();
     }
-    return await this.openDerivedDocument(bytes);
+    const derived = await this.openDerivedDocument(bytes, options);
+    reportProgress(options, "ready", totalPagesToGraft + 1, totalPagesToGraft + 1);
+    return derived;
   }
 
-  async reorganize(pageOrder: readonly number[]): Promise<PdfEngine> {
+  async reorganize(
+    pageOrder: readonly number[],
+    options?: PdfEngineOperationOptions,
+  ): Promise<PdfEngine> {
     if (!this.canAssemble) throw new Error("This PDF does not allow page assembly.");
     this.validatePageOrder(pageOrder);
-    await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 20));
+    throwIfAborted(options?.signal);
+    reportProgress(options, "reordering", 0, 2);
+    await yieldForCancellation(options?.signal);
     const outputDocument = this.openOriginalDocument();
     let outputBuffer: mupdf.Buffer | null = null;
     let bytes: Uint8Array;
     try {
-      outputDocument.rearrangePages([...pageOrder]);
+      const materializedOrder = this.materializeDuplicatePages(outputDocument, pageOrder);
+      outputDocument.rearrangePages(materializedOrder);
+      throwIfAborted(options?.signal);
+      reportProgress(options, "saving", 1, 2);
       outputBuffer = outputDocument.saveToBuffer(
         "garbage=2,compress,encrypt=keep",
       );
@@ -282,18 +407,25 @@ export class PdfEngine {
       outputBuffer?.destroy();
       outputDocument.destroy();
     }
-    return await this.openDerivedDocument(bytes);
+    const derived = await this.openDerivedDocument(bytes, options);
+    reportProgress(options, "ready", 2, 2);
+    return derived;
   }
 
   async exportPdf(
     edits: PageEdit[],
     pageOrder?: readonly number[],
+    options?: PdfEngineOperationOptions,
   ): Promise<Uint8Array<ArrayBuffer>> {
     if (!this.canEdit) throw new Error("This PDF does not allow editing.");
     if (pageOrder !== undefined && (!this.canAssemble || !this.canCopy)) {
       throw new Error("This PDF does not allow page extraction or assembly.");
     }
-    await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 20));
+    throwIfAborted(options?.signal);
+    const pagesToEdit = pageOrder?.length ?? edits.length;
+    const totalSteps = pagesToEdit + 2;
+    reportProgress(options, "applying-edits", 0, totalSteps);
+    await yieldForCancellation(options?.signal);
     const outputDocument = this.openOriginalDocument();
     let outputBuffer: mupdf.Buffer | null = null;
     try {
@@ -302,10 +434,22 @@ export class PdfEngine {
       }
       if (pageOrder !== undefined) this.validatePageOrder(pageOrder);
 
-      for (let index = 0; index < edits.length; index += 1) {
-        const edit = edits[index];
-        const info = this.pageInfos[index];
-        const page = outputDocument.loadPage(index);
+      // Ordered exports are the hot path for extraction and splitting. Arrange
+      // the requested pages first so each output only pays to apply edits to
+      // the pages it will contain. Mapping through pageOrder is important here:
+      // repeated source indexes must receive the same source edit on every
+      // materialized output page.
+      if (pageOrder !== undefined) {
+        const materializedOrder = this.materializeDuplicatePages(outputDocument, pageOrder);
+        outputDocument.rearrangePages(materializedOrder);
+      }
+
+      for (let outputIndex = 0; outputIndex < pagesToEdit; outputIndex += 1) {
+        throwIfAborted(options?.signal);
+        const sourceIndex = pageOrder?.[outputIndex] ?? outputIndex;
+        const edit = edits[sourceIndex];
+        const info = this.pageInfos[sourceIndex];
+        const page = outputDocument.loadPage(outputIndex);
         try {
           const pageObject = page.getObject();
           try {
@@ -333,10 +477,12 @@ export class PdfEngine {
         } finally {
           page.destroy();
         }
+        reportProgress(options, "applying-edits", outputIndex + 1, totalSteps);
+        await yieldForCancellation(options?.signal);
       }
 
-      if (pageOrder !== undefined) outputDocument.rearrangePages([...pageOrder]);
-
+      throwIfAborted(options?.signal);
+      reportProgress(options, "saving", pagesToEdit + 1, totalSteps);
       outputBuffer = outputDocument.saveToBuffer(
         "garbage=2,compress,encrypt=keep",
       );
@@ -367,6 +513,8 @@ export class PdfEngine {
       } finally {
         verification.destroy();
       }
+      throwIfAborted(options?.signal);
+      reportProgress(options, "ready", totalSteps, totalSteps);
       return bytes;
     } finally {
       outputBuffer?.destroy();
@@ -383,8 +531,13 @@ export class PdfEngine {
     return document;
   }
 
-  private async openDerivedDocument(bytes: Uint8Array): Promise<PdfEngine> {
-    const derived = await PdfEngine.open(bytes, this.password ?? undefined);
+  private async openDerivedDocument(
+    bytes: Uint8Array,
+    options?: PdfEngineOperationOptions,
+  ): Promise<PdfEngine> {
+    const derived = await PdfEngine.open(bytes, this.password ?? undefined, {
+      signal: options?.signal,
+    });
     if (
       derived.encrypted !== this.encrypted ||
       derived.requiresPassword !== this.requiresPassword
@@ -397,12 +550,39 @@ export class PdfEngine {
 
   private validatePageOrder(pageOrder: readonly number[]): void {
     if (!pageOrder.length) throw new Error("A PDF must contain at least one page.");
-    const unique = new Set(pageOrder);
-    if (unique.size !== pageOrder.length) {
-      throw new Error("The same page cannot appear more than once.");
+    if (pageOrder.length > MAX_PAGE_COUNT) {
+      throw new Error(`The organized PDF would exceed the ${MAX_PAGE_COUNT.toLocaleString()}-page safety limit.`);
     }
     if (pageOrder.some((index) => !Number.isInteger(index) || index < 0 || index >= this.pageInfos.length)) {
       throw new Error("The page order contains an invalid page number.");
+    }
+  }
+
+  /**
+   * MuPDF's rearrangePages expects unique source indexes. Materialize later
+   * occurrences first so a page-order array can also express duplication.
+   */
+  private materializeDuplicatePages(
+    document: mupdf.PDFDocument,
+    pageOrder: readonly number[],
+  ): number[] {
+    const used = new Set<number>();
+    const materialized: number[] = [];
+    let graftMap: mupdf.PDFGraftMap | null = null;
+    try {
+      for (const pageIndex of pageOrder) {
+        if (!used.has(pageIndex)) {
+          used.add(pageIndex);
+          materialized.push(pageIndex);
+          continue;
+        }
+        graftMap ??= document.newGraftMap();
+        graftMap.graftPage(-1, document, pageIndex);
+        materialized.push(document.countPages() - 1);
+      }
+      return materialized;
+    } finally {
+      graftMap?.destroy();
     }
   }
 

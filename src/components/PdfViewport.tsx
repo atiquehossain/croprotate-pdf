@@ -2,12 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Minus, Plus, Scan } from "lucide-react";
 import type { PageEdit, PageInfo, VisualRect } from "../types";
-import type { PdfEngine } from "../pdf/engine";
+import type { PdfWorkerDocument } from "../pdf/workerClient";
 import { totalRotation, visualPageDimensions } from "../pdf/geometry";
 import { CropOverlay } from "./CropOverlay";
 
 interface PdfViewportProps {
-  engine: PdfEngine;
+  engine: PdfWorkerDocument;
   pageInfo: PageInfo;
   pageEdit: PageEdit;
   pageIndex: number;
@@ -134,7 +134,8 @@ export function PdfViewport({
 
   useEffect(() => {
     let cancelled = false;
-    const frame = window.requestAnimationFrame(() => {
+    const controller = new AbortController();
+    const frame = window.requestAnimationFrame(() => void (async () => {
       if (cancelled) return;
       setRendering(true);
       setRenderError(null);
@@ -142,7 +143,13 @@ export function PdfViewport({
         const deviceScale = window.devicePixelRatio || 1;
         const maxScale = 3200 / Math.max(pageWidthPoints, pageHeightPoints);
         const renderScale = Math.min(cssScale * deviceScale, maxScale, 5);
-        const rendered = engine.renderPage(pageIndex, pageEdit.rotation, renderScale, true);
+        const rendered = await engine.renderPage(
+          pageIndex,
+          pageEdit.rotation,
+          renderScale,
+          true,
+          { signal: controller.signal },
+        );
         if (cancelled) return;
         const canvas = canvasRef.current;
         const context = canvas?.getContext("2d");
@@ -156,14 +163,15 @@ export function PdfViewport({
         );
         setRendering(false);
       } catch (error) {
-        if (!cancelled) {
+        if (!cancelled && !(error instanceof Error && error.name === "AbortError")) {
           setRendering(false);
           setRenderError(error instanceof Error ? error.message : String(error));
         }
       }
-    });
+    })());
     return () => {
       cancelled = true;
+      controller.abort();
       window.cancelAnimationFrame(frame);
     };
   }, [cssScale, engine, pageEdit.rotation, pageHeightPoints, pageIndex, pageWidthPoints]);

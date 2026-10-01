@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="CropRotate PDF">
+  <defs>
+    <linearGradient id="g" x1="144" y1="112" x2="368" y2="400" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5eead4"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="#101414"/>
+  <path d="M190 112h116l64 64v224H190c-26 0-48-22-48-48V160c0-26 22-48 48-48Z" fill="url(#g)"/>
+  <path d="M306 112v64h64" fill="none" stroke="#d8fffa" stroke-width="20" stroke-linejoin="round"/>
+  <path d="M206 238v-28h28M306 210h28v28M334 302v28h-28M234 330h-28v-28" fill="none" stroke="#052621" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

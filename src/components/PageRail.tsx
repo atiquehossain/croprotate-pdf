@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { PageEdit, PageInfo } from "../types";
-import type { PdfEngine } from "../pdf/engine";
+import type { PdfWorkerDocument } from "../pdf/workerClient";
 import { totalRotation, visualPageDimensions } from "../pdf/geometry";
 
 interface ThumbnailProps {
-  engine: PdfEngine;
+  engine: PdfWorkerDocument;
   info: PageInfo;
   edit: PageEdit;
   position: number;
@@ -35,12 +35,19 @@ function Thumbnail({ engine, info, edit, position, active, onSelect }: Thumbnail
   useEffect(() => {
     if (!visible) return;
     let cancelled = false;
-    const frame = window.requestAnimationFrame(() => {
+    const controller = new AbortController();
+    const frame = window.requestAnimationFrame(() => void (async () => {
       try {
         const rotation = totalRotation(info, edit.rotation);
         const [width, height] = visualPageDimensions(info, rotation);
         const scale = Math.min(132 / width, 156 / height, 0.32);
-        const rendered = engine.renderPage(info.index, edit.rotation, scale, true);
+        const rendered = await engine.renderPage(
+          info.index,
+          edit.rotation,
+          scale,
+          true,
+          { signal: controller.signal },
+        );
         if (cancelled || !canvasRef.current) return;
         const canvas = canvasRef.current;
         const context = canvas.getContext("2d");
@@ -51,9 +58,10 @@ function Thumbnail({ engine, info, edit, position, active, onSelect }: Thumbnail
       } catch {
         // The numbered placeholder remains usable if a thumbnail cannot render.
       }
-    });
+    })());
     return () => {
       cancelled = true;
+      controller.abort();
       window.cancelAnimationFrame(frame);
     };
   }, [edit.rotation, engine, info, visible]);
@@ -76,7 +84,7 @@ function Thumbnail({ engine, info, edit, position, active, onSelect }: Thumbnail
 }
 
 interface PageRailProps {
-  engine: PdfEngine;
+  engine: PdfWorkerDocument;
   pages: PageInfo[];
   pageIds: string[];
   edits: PageEdit[];

@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "check": "npm run test && npm run build"
+    "verify:pwa": "node scripts/verify-pwa.mjs",
+    "check": "npm run test && npm run build && npm run verify:pwa"
   },
   "dependencies": {
     "lucide-react": "^0.544.0",

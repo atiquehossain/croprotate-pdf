@@ -3,6 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; frame-src 'none'; child-src 'none'; script-src 'none'; script-src-attr 'none'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; worker-src 'none'; manifest-src 'none'; media-src 'none'"
+    />
     <title>Privacy Notice | CropRotate PDF</title>
     <meta
       name="description"
@@ -10,96 +14,10 @@
     />
     <meta name="robots" content="index, follow, max-image-preview:large" />
     <meta name="theme-color" content="#101414" />
+    <meta name="referrer" content="no-referrer" />
     <link rel="canonical" href="./privacy.html" />
     <link rel="icon" type="image/svg+xml" href="./icon.svg" />
-    <style>
-      :root {
-        color-scheme: dark light;
-        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        --bg: #0b1012;
-        --panel: #11191c;
-        --text: #f3f7f5;
-        --muted: #a8b8b5;
-        --line: #293538;
-        --accent: #5eead4;
-      }
-      * { box-sizing: border-box; }
-      body {
-        min-width: 320px;
-        min-height: 100vh;
-        margin: 0;
-        background: var(--bg);
-        color: var(--text);
-      }
-      main {
-        width: min(760px, calc(100% - 40px));
-        margin: 0 auto;
-        padding: clamp(48px, 9vw, 92px) 0 64px;
-      }
-      a { color: var(--accent); }
-      .back {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 48px;
-        font-weight: 700;
-        text-decoration: none;
-      }
-      .eyebrow {
-        margin: 0 0 10px;
-        color: var(--accent);
-        font-size: 0.78rem;
-        font-weight: 800;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-      }
-      h1 {
-        margin: 0 0 18px;
-        font-size: clamp(2.4rem, 8vw, 4.8rem);
-        line-height: 0.98;
-        letter-spacing: -0.055em;
-      }
-      h2 {
-        margin: 38px 0 10px;
-        font-size: 1.25rem;
-      }
-      p, li {
-        color: var(--muted);
-        font-size: 1rem;
-        line-height: 1.72;
-      }
-      .summary {
-        margin: 28px 0;
-        padding: 22px 24px;
-        border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line));
-        border-radius: 16px;
-        background: color-mix(in srgb, var(--accent) 7%, var(--panel));
-      }
-      .summary strong {
-        display: block;
-        margin-bottom: 6px;
-        color: var(--text);
-        font-size: 1.05rem;
-      }
-      ul { padding-left: 22px; }
-      footer {
-        margin-top: 50px;
-        padding-top: 22px;
-        border-top: 1px solid var(--line);
-        color: var(--muted);
-        font-size: 0.86rem;
-      }
-      @media (prefers-color-scheme: light) {
-        :root {
-          --bg: #f4f7f5;
-          --panel: #ffffff;
-          --text: #14201d;
-          --muted: #596c67;
-          --line: #d8e1de;
-          --accent: #087f72;
-        }
-      }
-    </style>
+    <link rel="stylesheet" href="./privacy.css" />
   </head>
   <body>
     <main>
@@ -124,7 +42,7 @@
       <p>
         Selected PDF bytes, generated previews, passwords, crop and rotation choices, page
         order, selections, and undo history live in browser memory for the active editing session.
-        Merging, reordering, removal, and extraction also happen in that tab. CropRotate PDF does
+        Merging, splitting, duplication, reordering, removal, and extraction also happen in that tab. CropRotate PDF does
         not use cookies, local storage, session storage, IndexedDB, analytics, or a server
         database to retain those document contents.
       </p>
@@ -154,8 +72,10 @@
         The static app is hosted on GitHub Pages. Like other web hosts, GitHub may receive
         ordinary connection information such as an IP address, request time, requested page,
         browser details, and referring page. Your browser may cache the app's code and visual
-        assets for performance. Neither of these actions sends the PDFs you selected to the app's
-        host.
+        assets for performance and offline use. The offline cache uses an explicit list of app
+        files; it does not cache selected PDFs, passwords, previews, edits, generated downloads,
+        or arbitrary requests. None of these app-cache operations sends the PDFs you selected to
+        the app's host.
       </p>
 
       <h2>Things outside this app</h2>

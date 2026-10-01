@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  CircleStop,
   Download,
   FileText,
   Files,
   FolderOpen,
   Github,
+  MonitorDown,
   Redo2,
+  RefreshCw,
   ShieldCheck,
   Sparkles,
   Undo2,
   UploadCloud,
+  WifiOff,
   X,
 } from "lucide-react";
 import type {
@@ -20,7 +24,12 @@ import type {
   TrimSensitivity,
   VisualRect,
 } from "./types";
-import type { PdfEngine } from "./pdf/engine";
+import type {
+  PdfWorkerClient,
+  PdfWorkerDocument,
+  PdfWorkerOperationOptions,
+  PdfWorkerProgress,
+} from "./pdf/workerClient";
 import {
   aspectRatioForPreset,
   cropsEqual,
@@ -39,8 +48,39 @@ import { Inspector } from "./components/Inspector";
 import { PageRail } from "./components/PageRail";
 import { PageOrganizer } from "./components/PageOrganizer";
 import { PdfViewport } from "./components/PdfViewport";
+import { buildSplitPlan, type SplitRequest } from "./components/organizerTools";
+import { pushBoundedHistory } from "./utils/boundedHistory";
+import { bytesToWholeMebibytes, splitOutputLimitBytes } from "./utils/memoryLimits";
+import { createStoredZipInWorker } from "./utils/zipClient";
+import { usePwa } from "./pwa/usePwa";
 
-type PdfEngineModule = typeof import("./pdf/engine");
+type PdfEngine = PdfWorkerDocument;
+type PdfEngineModule = typeof import("./pdf/workerClient");
+
+interface OperationState {
+  id: number;
+  label: string;
+  message: string;
+  completed: number;
+  total: number;
+}
+
+interface OperationHandle {
+  id: number;
+  controller: AbortController;
+  options: PdfWorkerOperationOptions;
+}
+
+interface DocumentSnapshot {
+  bytes: Uint8Array<ArrayBuffer>;
+  edits: PageEdit[];
+  pageIds: string[];
+  selectedPageIds: string[];
+  activePageId: string;
+  fileName: string;
+  fileSize: number;
+  dirty: boolean;
+}
 
 interface NetworkInformationLike {
   effectiveType?: string;
@@ -53,7 +93,7 @@ const MAX_WORKING_INPUT_BYTES = 100 * 1024 * 1024;
 
 function loadPdfEngine(): Promise<PdfEngineModule> {
   if (pdfEngineModulePromise === null) {
-    pdfEngineModulePromise = import("./pdf/engine").catch((error: unknown) => {
+    pdfEngineModulePromise = import("./pdf/workerClient").catch((error: unknown) => {
       pdfEngineModulePromise = null;
       throw error;
     });
@@ -61,10 +101,8 @@ function loadPdfEngine(): Promise<PdfEngineModule> {
   return pdfEngineModulePromise;
 }
 
-function warmPdfEngine(): void {
-  void loadPdfEngine().catch(() => {
-    // Opening a PDF will retry and surface a useful error if warm-up failed.
-  });
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function shouldWarmPdfEngineOnIdle(): boolean {
@@ -116,6 +154,18 @@ async function readPdfFile(file: File): Promise<Uint8Array<ArrayBuffer>> {
 
 function downloadPdfBytes(bytes: Uint8Array<ArrayBuffer>, fileName: string): void {
   const blob = new Blob([bytes], { type: "application/pdf" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function downloadZipBytes(bytes: Uint8Array<ArrayBuffer>, fileName: string): void {
+  const blob = new Blob([bytes], { type: "application/zip" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -194,6 +244,12 @@ export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addFileInputRef = useRef<HTMLInputElement>(null);
   const engineRef = useRef<PdfEngine | null>(null);
+  const workerClientRef = useRef<PdfWorkerClient | null>(null);
+  const workerClientPromiseRef = useRef<Promise<PdfWorkerClient> | null>(null);
+  const mountedRef = useRef(true);
+  const operationControllerRef = useRef<AbortController | null>(null);
+  const operationSequenceRef = useRef(0);
+  const approvedReloadRef = useRef(false);
   const brandButtonRef = useRef<HTMLButtonElement>(null);
   const openButtonRef = useRef<HTMLButtonElement>(null);
   const organizerButtonRef = useRef<HTMLButtonElement>(null);
@@ -208,12 +264,15 @@ export function App() {
   const [selectedPageIds, setSelectedPageIds] = useState<string[]>([]);
   const [undoStack, setUndoStack] = useState<PageEdit[][]>([]);
   const [redoStack, setRedoStack] = useState<PageEdit[][]>([]);
+  const [structureUndoStack, setStructureUndoStack] = useState<DocumentSnapshot[]>([]);
+  const [structureRedoStack, setStructureRedoStack] = useState<DocumentSnapshot[]>([]);
   const [pageIndex, setPageIndex] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [aspectPreset, setAspectPreset] = useState<AspectPreset>("Free");
   const [aspectLocked, setAspectLocked] = useState(false);
   const [status, setStatus] = useState("Open a PDF to begin.");
   const [busy, setBusy] = useState(false);
+  const [operation, setOperation] = useState<OperationState | null>(null);
   const [dirty, setDirty] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [pendingPassword, setPendingPassword] = useState<PendingPassword | null>(null);
@@ -221,6 +280,7 @@ export function App() {
   const [showAbout, setShowAbout] = useState(false);
   const [showPrivacy, setShowPrivacy] = useState(false);
   const [showOrganizer, setShowOrganizer] = useState(false);
+  const pwa = usePwa();
 
   const pages = engine?.pageInfos ?? [];
   const currentPage = pages[pageIndex];
@@ -235,6 +295,162 @@ export function App() {
     [sourceUrl],
   );
   const modalOpen = pendingPassword !== null || showAbout || showPrivacy || showOrganizer;
+
+  const handleFatalWorkerError = useCallback((failedClient: PdfWorkerClient, error: Error) => {
+    if (workerClientRef.current !== failedClient) return;
+    workerClientRef.current = null;
+    workerClientPromiseRef.current = null;
+    if (!mountedRef.current) return;
+
+    const hadOpenDocument = engineRef.current !== null;
+    const fatalOperationId = ++operationSequenceRef.current;
+    operationControllerRef.current?.abort();
+    operationControllerRef.current = null;
+    engineRef.current?.close();
+    engineRef.current = null;
+    setEngine(null);
+    setFileName("");
+    setFileSize(0);
+    setEdits([]);
+    setPageIds([]);
+    setSelectedPageIds([]);
+    setUndoStack([]);
+    setRedoStack([]);
+    setStructureUndoStack([]);
+    setStructureRedoStack([]);
+    setPageIndex(0);
+    setZoom(1);
+    setAspectPreset("Free");
+    setAspectLocked(false);
+    setBusy(false);
+    setOperation(null);
+    setDirty(false);
+    setDragActive(false);
+    setPendingPassword(null);
+    setPasswordValue("");
+    setShowOrganizer(false);
+    const fatalMessage = hadOpenDocument
+      ? `The private PDF engine stopped unexpectedly, so the open in-memory PDF and unsaved edits were cleared. ` +
+        `Your original file was not changed or uploaded. Please reopen it. Technical detail: ${error.message}`
+      : `The private PDF engine stopped unexpectedly before a PDF was opened. Nothing was uploaded. ` +
+        `Please try opening the PDF again. Technical detail: ${error.message}`;
+    setStatus(fatalMessage);
+    window.setTimeout(() => {
+      if (
+        mountedRef.current &&
+        operationSequenceRef.current === fatalOperationId &&
+        engineRef.current === null
+      ) {
+        setStatus(fatalMessage);
+      }
+    }, 0);
+    window.requestAnimationFrame(() => openButtonRef.current?.focus());
+  }, []);
+
+  const getWorkerClient = useCallback(async (): Promise<PdfWorkerClient> => {
+    if (workerClientRef.current && !workerClientRef.current.isTerminated) {
+      return workerClientRef.current;
+    }
+    if (workerClientRef.current?.isTerminated) workerClientRef.current = null;
+    if (workerClientPromiseRef.current) return workerClientPromiseRef.current;
+
+    const pending = loadPdfEngine().then(({ PdfWorkerClient: WorkerClient }) => {
+      if (workerClientRef.current && !workerClientRef.current.isTerminated) {
+        return workerClientRef.current;
+      }
+      let client!: PdfWorkerClient;
+      client = new WorkerClient(
+        undefined,
+        (error) => handleFatalWorkerError(client, error),
+      );
+      workerClientRef.current = client;
+      return client;
+    });
+    workerClientPromiseRef.current = pending;
+    void pending.then(
+      () => {
+        if (workerClientPromiseRef.current === pending) workerClientPromiseRef.current = null;
+      },
+      () => {
+        if (workerClientPromiseRef.current === pending) workerClientPromiseRef.current = null;
+      },
+    );
+    return pending;
+  }, [handleFatalWorkerError]);
+
+  const warmPdfWorker = useCallback(() => {
+    void getWorkerClient().catch(() => {
+      // Opening a PDF will retry and surface a useful error if warm-up failed.
+      workerClientRef.current = null;
+    });
+  }, [getWorkerClient]);
+
+  const beginOperation = useCallback((label: string): OperationHandle => {
+    const id = ++operationSequenceRef.current;
+    const controller = new AbortController();
+    operationControllerRef.current = controller;
+    setOperation({ id, label, message: label, completed: 0, total: 0 });
+    const onProgress = (progress: PdfWorkerProgress) => {
+      if (operationSequenceRef.current !== id) return;
+      setOperation({
+        id,
+        label,
+        message: progress.message,
+        completed: progress.completed,
+        total: progress.total,
+      });
+    };
+    return { id, controller, options: { signal: controller.signal, onProgress } };
+  }, []);
+
+  const updateOperation = useCallback((handle: OperationHandle, message: string, completed = 0, total = 0) => {
+    if (operationSequenceRef.current !== handle.id) return;
+    setOperation({ id: handle.id, label: message, message, completed, total });
+  }, []);
+
+  const endOperation = useCallback((handle: OperationHandle) => {
+    if (operationSequenceRef.current !== handle.id) return;
+    operationControllerRef.current = null;
+    setOperation(null);
+  }, []);
+
+  const cancelOperation = useCallback(() => {
+    const controller = operationControllerRef.current;
+    if (!controller || controller.signal.aborted) return;
+    controller.abort();
+    setOperation((current) => current ? { ...current, message: "Cancelling safely…" } : current);
+    setStatus("Cancelling the local PDF operation…");
+  }, []);
+
+  const installApp = useCallback(async () => {
+    const outcome = await pwa.install();
+    if (outcome === "accepted") setStatus("CropRotate PDF was added to your device for quick, offline access.");
+    else if (outcome === "dismissed") setStatus("Install dismissed. You can keep using the website normally.");
+    else setStatus("Use your browser menu to install this app on your device.");
+  }, [pwa]);
+
+  const applyAppUpdate = useCallback(async () => {
+    if (engine && !window.confirm(
+      dirty
+        ? "Applying this update reloads the app and discards the unsaved working session. Save your PDF first unless you are ready to continue. Apply now?"
+        : "Applying this update reloads the app and closes the current PDF. Apply now?",
+    )) return;
+    const activated = await pwa.update();
+    if (!activated) {
+      setStatus("The app is already up to date.");
+      return;
+    }
+    approvedReloadRef.current = true;
+    setStatus("Applying the app update…");
+    let reloaded = false;
+    const reload = () => {
+      if (reloaded) return;
+      reloaded = true;
+      window.location.reload();
+    };
+    navigator.serviceWorker?.addEventListener("controllerchange", reload, { once: true });
+    window.setTimeout(reload, 1_500);
+  }, [dirty, engine, pwa]);
 
   const closePassword = useCallback(() => {
     if (busy) return;
@@ -290,31 +506,48 @@ export function App() {
       requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
       cancelIdleCallback?: (handle: number) => void;
     };
-    const idleHandle = idleWindow.requestIdleCallback?.(warmPdfEngine, { timeout: 3_000 });
+    const idleHandle = idleWindow.requestIdleCallback?.(warmPdfWorker, { timeout: 3_000 });
     if (idleHandle !== undefined) {
       return () => idleWindow.cancelIdleCallback?.(idleHandle);
     }
 
-    const timeoutHandle = window.setTimeout(warmPdfEngine, 1_500);
+    const timeoutHandle = window.setTimeout(warmPdfWorker, 1_500);
     return () => window.clearTimeout(timeoutHandle);
-  }, []);
+  }, [warmPdfWorker]);
 
-  useEffect(
-    () => () => {
-      engineRef.current?.close();
-    },
-    [],
-  );
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      operationControllerRef.current?.abort();
+      workerClientRef.current?.terminate("The browser tab was closed.");
+      void workerClientPromiseRef.current?.then(
+        (client) => {
+          if (!mountedRef.current) client.terminate("The browser tab was closed.");
+        },
+        () => undefined,
+      );
+    };
+  }, []);
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (!dirty) return;
+      if (!dirty || approvedReloadRef.current) return;
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, [dirty]);
+
+  useEffect(() => {
+    if (!modalOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [modalOpen]);
 
   const commitEdits = useCallback(
     (next: PageEdit[], message: string) => {
@@ -351,6 +584,20 @@ export function App() {
     setStatus("Redid the last edit.");
   }, [busy, edits, redoStack]);
 
+  const captureDocumentSnapshot = useCallback(async (
+    current: PdfEngine,
+    handle: OperationHandle,
+  ): Promise<DocumentSnapshot> => ({
+    bytes: await current.snapshotBytes(handle.options),
+    edits: cloneEdits(edits),
+    pageIds: [...pageIds],
+    selectedPageIds: [...selectedPageIds],
+    activePageId: pageIds[pageIndex] ?? pageIds[0] ?? "",
+    fileName,
+    fileSize,
+    dirty,
+  }), [dirty, edits, fileName, fileSize, pageIds, pageIndex, selectedPageIds]);
+
   const installDocument = useCallback((opened: PdfEngine, file: File) => {
     engineRef.current?.close();
     setEngine(opened);
@@ -362,6 +609,8 @@ export function App() {
     setSelectedPageIds([]);
     setUndoStack([]);
     setRedoStack([]);
+    setStructureUndoStack([]);
+    setStructureRedoStack([]);
     setPageIndex(0);
     setZoom(1);
     setAspectPreset("Free");
@@ -377,6 +626,7 @@ export function App() {
     addedFiles: readonly File[],
     addedPageCount: number,
     addedEncryptedPdf: boolean,
+    previousSnapshot: DocumentSnapshot,
   ) => {
     const previous = engineRef.current;
     setEngine(opened);
@@ -389,6 +639,8 @@ export function App() {
     setPageIds([...pageIds, ...createPageIds(addedPageCount)]);
     setUndoStack([]);
     setRedoStack([]);
+    setStructureUndoStack((history) => pushBoundedHistory(history, previousSnapshot));
+    setStructureRedoStack([]);
     setFileName(combinedFileName(fileName));
     setFileSize(opened.byteLength);
     setDirty(true);
@@ -398,17 +650,24 @@ export function App() {
     const encryptionNote = addedEncryptedPdf
       ? " The combined copy uses the first PDF's password settings."
       : "";
-    setStatus(`Added ${addedPageCount} page${addedPageCount === 1 ? "" : "s"} from ${fileCount} PDF${fileCount === 1 ? "" : "s"} locally. Existing page edits were kept, edit history was reset, and nothing was uploaded.${encryptionNote}`);
+    setStatus(`Added ${addedPageCount} page${addedPageCount === 1 ? "" : "s"} from ${fileCount} PDF${fileCount === 1 ? "" : "s"} locally. Existing page edits were kept, and this page change can be undone.${encryptionNote}`);
   }, [edits, fileName, pageIds]);
 
   const openBytes = useCallback(
-    async (file: File, bytes: Uint8Array, password?: string, ownerPasswordAttempt = false) => {
-      setBusy(true);
+    async (
+      file: File,
+      bytes: Uint8Array,
+      password?: string,
+      ownerPasswordAttempt = false,
+      activeOperation?: OperationHandle,
+    ) => {
+      const ownsOperation = activeOperation === undefined;
+      const handle = activeOperation ?? beginOperation(`Opening ${file.name} locally…`);
+      if (ownsOperation) setBusy(true);
       setStatus(`Opening ${file.name} locally…`);
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 30));
       try {
-        const { PdfEngine: PdfEngineRuntime } = await loadPdfEngine();
-        const opened = await PdfEngineRuntime.open(bytes, password);
+        const client = await getWorkerClient();
+        const opened = await client.open(bytes, password, handle.options);
         if (!opened.canEdit || !opened.canAssemble || !opened.canCopy) {
           opened.close();
           setPendingPassword({
@@ -427,7 +686,9 @@ export function App() {
           window.requestAnimationFrame(() => openButtonRef.current?.focus());
         }
       } catch (error) {
-        if (error instanceof Error && error.name === "PasswordRequiredError") {
+        if (isAbortError(error)) {
+          setStatus(`Cancelled opening ${file.name}.${engineRef.current ? " The previous PDF is still open." : ""}`);
+        } else if (error instanceof Error && error.name === "PasswordRequiredError") {
           setPendingPassword({
             file,
             bytes,
@@ -442,10 +703,13 @@ export function App() {
           setStatus(`Could not open ${file.name}: ${message}${engineRef.current ? " The previous PDF is still open." : ""}`);
         }
       } finally {
-        setBusy(false);
+        if (ownsOperation) {
+          setBusy(false);
+          endOperation(handle);
+        }
       }
     },
-    [installDocument],
+    [beginOperation, endOperation, getWorkerClient, installDocument],
   );
 
   const acceptFile = useCallback(
@@ -455,20 +719,27 @@ export function App() {
         return;
       }
       if (dirty && !window.confirm("Edits are not auto-saved. Open another PDF and discard the current unsaved edits?")) return;
-      warmPdfEngine();
+      warmPdfWorker();
       setBusy(true);
+      const handle = beginOperation(`Reading ${file.name} locally…`);
       setStatus(`Reading ${file.name} locally…`);
       try {
         const bytes = await readPdfFile(file);
-        await openBytes(file, bytes);
+        if (handle.controller.signal.aborted) throw new DOMException("The PDF operation was cancelled.", "AbortError");
+        await openBytes(file, bytes, undefined, false, handle);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setStatus(`Could not open ${file.name}: ${message}${engineRef.current ? " The previous PDF is still open." : ""}`);
+        if (isAbortError(error)) {
+          setStatus(`Cancelled opening ${file.name}.${engineRef.current ? " The previous PDF is still open." : ""}`);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          setStatus(`Could not open ${file.name}: ${message}${engineRef.current ? " The previous PDF is still open." : ""}`);
+        }
       } finally {
         setBusy(false);
+        endOperation(handle);
       }
     },
-    [busy, dirty, openBytes],
+    [beginOperation, busy, dirty, endOperation, openBytes, warmPdfWorker],
   );
 
   const chooseFile = useCallback(() => {
@@ -476,20 +747,28 @@ export function App() {
       setStatus("Wait for the current PDF operation to finish.");
       return;
     }
-    warmPdfEngine();
+    warmPdfWorker();
     fileInputRef.current?.click();
-  }, [busy]);
+  }, [busy, warmPdfWorker]);
 
   const appendBytes = useCallback(
-    async (file: File, bytes: Uint8Array, password?: string, ownerPasswordAttempt = false) => {
+    async (
+      file: File,
+      bytes: Uint8Array,
+      password?: string,
+      ownerPasswordAttempt = false,
+      activeOperation?: OperationHandle,
+    ) => {
       const current = engineRef.current;
       if (!current) return;
-      setBusy(true);
+      const ownsOperation = activeOperation === undefined;
+      const handle = activeOperation ?? beginOperation(`Adding ${file.name} locally…`);
+      if (ownsOperation) setBusy(true);
       setStatus(`Adding ${file.name} locally…`);
       let imported: PdfEngine | null = null;
       try {
-        const { PdfEngine: PdfEngineRuntime } = await loadPdfEngine();
-        imported = await PdfEngineRuntime.open(bytes, password);
+        const client = await getWorkerClient();
+        imported = await client.open(bytes, password, handle.options);
         if (!imported.canCopy) {
           imported.close();
           imported = null;
@@ -516,13 +795,16 @@ export function App() {
         }
         const addedPageCount = imported.pageInfos.length;
         const importedEncrypted = imported.encrypted;
-        const combined = await current.append([imported]);
-        installMergedDocument(combined, [file], addedPageCount, importedEncrypted);
+        const previousSnapshot = await captureDocumentSnapshot(current, handle);
+        const combined = await current.append([imported], handle.options);
+        installMergedDocument(combined, [file], addedPageCount, importedEncrypted, previousSnapshot);
         if (password !== undefined) {
           window.requestAnimationFrame(() => organizerAddButtonRef.current?.focus());
         }
       } catch (error) {
-        if (error instanceof Error && error.name === "PasswordRequiredError") {
+        if (isAbortError(error)) {
+          setStatus(`Cancelled adding ${file.name}. The current PDF is unchanged.`);
+        } else if (error instanceof Error && error.name === "PasswordRequiredError") {
           setPendingPassword({
             file,
             bytes,
@@ -538,10 +820,13 @@ export function App() {
         }
       } finally {
         imported?.close();
-        setBusy(false);
+        if (ownsOperation) {
+          setBusy(false);
+          endOperation(handle);
+        }
       }
     },
-    [installMergedDocument],
+    [beginOperation, captureDocumentSnapshot, endOperation, getWorkerClient, installMergedDocument],
   );
 
   const acceptAddedFiles = useCallback(
@@ -557,28 +842,35 @@ export function App() {
         setStatus("Could not add the selected PDFs: the working set would exceed the 100 MB in-memory safety limit. Add fewer or smaller files. The current PDF is unchanged.");
         return;
       }
-      warmPdfEngine();
+      warmPdfWorker();
       setBusy(true);
+      const handle = beginOperation(`Reading ${files.length} PDF${files.length === 1 ? "" : "s"} locally…`);
       setStatus(`Reading ${files.length} PDF${files.length === 1 ? "" : "s"} locally…`);
       if (files.length === 1) {
         try {
           const bytes = await readPdfFile(files[0]);
-          await appendBytes(files[0], bytes);
+          if (handle.controller.signal.aborted) throw new DOMException("The PDF operation was cancelled.", "AbortError");
+          await appendBytes(files[0], bytes, undefined, false, handle);
         } catch (error) {
-          setStatus(`Could not add ${files[0].name}: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
+          setStatus(isAbortError(error)
+            ? `Cancelled adding ${files[0].name}. The current PDF is unchanged.`
+            : `Could not add ${files[0].name}: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
         } finally {
           setBusy(false);
+          endOperation(handle);
         }
         return;
       }
 
       const imported: PdfEngine[] = [];
       try {
-        const { PdfEngine: PdfEngineRuntime } = await loadPdfEngine();
-        for (const file of files) {
+        const client = await getWorkerClient();
+        for (const [fileIndex, file] of files.entries()) {
+          updateOperation(handle, `Reading ${file.name}…`, fileIndex, files.length + 2);
           const bytes = await readPdfFile(file);
+          if (handle.controller.signal.aborted) throw new DOMException("The PDF operation was cancelled.", "AbortError");
           try {
-            const opened = await PdfEngineRuntime.open(bytes);
+            const opened = await client.open(bytes, undefined, handle.options);
             if (!opened.canCopy) {
               opened.close();
               throw new Error(`${file.name} does not allow content copying. Add it by itself and enter the owner password.`);
@@ -598,28 +890,33 @@ export function App() {
           throw new Error("The first PDF's settings would remove another PDF's encryption or required open password. Open the protected PDF first, then add the other PDFs to it.");
         }
         const addedPageCount = imported.reduce((total, item) => total + item.pageInfos.length, 0);
-        const combined = await current.append(imported);
+        const previousSnapshot = await captureDocumentSnapshot(current, handle);
+        const combined = await current.append(imported, handle.options);
         installMergedDocument(
           combined,
           files,
           addedPageCount,
           imported.some((item) => item.encrypted),
+          previousSnapshot,
         );
       } catch (error) {
-        setStatus(`Could not add the selected PDFs: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
+        setStatus(isAbortError(error)
+          ? "Cancelled adding the selected PDFs. The current PDF is unchanged."
+          : `Could not add the selected PDFs: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
       } finally {
         imported.forEach((item) => item.close());
         setBusy(false);
+        endOperation(handle);
       }
     },
-    [appendBytes, busy, installMergedDocument],
+    [appendBytes, beginOperation, busy, captureDocumentSnapshot, endOperation, getWorkerClient, installMergedDocument, updateOperation, warmPdfWorker],
   );
 
   const chooseAddedFiles = useCallback(() => {
     if (busy || !engineRef.current) return;
-    warmPdfEngine();
+    warmPdfWorker();
     addFileInputRef.current?.click();
-  }, [busy]);
+  }, [busy, warmPdfWorker]);
 
   const cropCurrentPage = useCallback(
     (visualRect: VisualRect) => {
@@ -708,6 +1005,7 @@ export function App() {
       const analyzedPage = pageIndex;
       const rotation = currentEdit.rotation;
       setBusy(true);
+      const handle = beginOperation(`Analyzing page ${analyzedPage + 1} margins…`);
       setStatus(`Analyzing page ${analyzedPage + 1} margins…`);
       try {
         const result = await engine.autoTrim(
@@ -716,6 +1014,7 @@ export function App() {
           sensitivity,
           padding,
           includeAnnotations,
+          handle.options,
         );
         if (result === null) {
           setStatus("Auto-trim found no safe removable border; crop unchanged.");
@@ -729,12 +1028,15 @@ export function App() {
         next[analyzedPage].crop = crop;
         commitEdits(next, `Auto-trimmed page ${analyzedPage + 1}.`);
       } catch (error) {
-        setStatus(`Auto-trim failed: ${error instanceof Error ? error.message : String(error)}`);
+        setStatus(isAbortError(error)
+          ? "Auto-trim cancelled; crop unchanged."
+          : `Auto-trim failed: ${error instanceof Error ? error.message : String(error)}`);
       } finally {
         setBusy(false);
+        endOperation(handle);
       }
     },
-    [busy, commitEdits, currentEdit, edits, engine, pageIndex],
+    [beginOperation, busy, commitEdits, currentEdit, edits, endOperation, engine, pageIndex],
   );
 
   const applyBatch = useCallback(
@@ -822,11 +1124,18 @@ export function App() {
       const current = engineRef.current;
       if (!current || busy) return;
       setBusy(true);
+      const handle = beginOperation("Rebuilding the page order locally…");
       setStatus("Rebuilding the page order locally…");
       try {
-        const reordered = await current.reorganize(pageOrder);
+        const previousSnapshot = await captureDocumentSnapshot(current, handle);
+        const reordered = await current.reorganize(pageOrder, handle.options);
         const nextEdits = pageOrder.map((index) => cloneEdits([edits[index]])[0]);
-        const nextPageIds = pageOrder.map((index) => pageIds[index]);
+        const occurrences = new Map<number, number>();
+        const nextPageIds = pageOrder.map((index) => {
+          const occurrence = occurrences.get(index) ?? 0;
+          occurrences.set(index, occurrence + 1);
+          return occurrence === 0 ? pageIds[index] : createPageId();
+        });
         setEngine(reordered);
         engineRef.current = reordered;
         current.close();
@@ -837,16 +1146,21 @@ export function App() {
         setZoom(1);
         setUndoStack([]);
         setRedoStack([]);
+        setStructureUndoStack((history) => pushBoundedHistory(history, previousSnapshot));
+        setStructureRedoStack([]);
         setFileSize(reordered.byteLength);
         setDirty(true);
-        setStatus(`${message} Edit history was reset.`);
+        setStatus(`${message} This page change can be undone.`);
       } catch (error) {
-        setStatus(`Could not reorganize the pages: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
+        setStatus(isAbortError(error)
+          ? "Cancelled the page change. The current PDF is unchanged."
+          : `Could not reorganize the pages: ${error instanceof Error ? error.message : String(error)} The current PDF is unchanged.`);
       } finally {
         setBusy(false);
+        endOperation(handle);
       }
     },
-    [busy, edits, pageIds],
+    [beginOperation, busy, captureDocumentSnapshot, edits, endOperation, pageIds],
   );
 
   const movePage = useCallback(
@@ -866,6 +1180,97 @@ export function App() {
     [applyPageOrder, pageIds, pageIndex, selectedPageIds],
   );
 
+  const moveSelectedPages = useCallback((selectedIds: readonly string[], insertionIndex: number) => {
+    if (busy || selectedIds.length === 0) return;
+    const selected = new Set(selectedIds);
+    const selectedIndices = pageIds
+      .map((pageId, index) => selected.has(pageId) ? index : -1)
+      .filter((index) => index >= 0);
+    const remainingIndices = pageIds
+      .map((_, index) => index)
+      .filter((index) => !selected.has(pageIds[index]));
+    const slot = Math.max(0, Math.min(remainingIndices.length, insertionIndex));
+    const order = [
+      ...remainingIndices.slice(0, slot),
+      ...selectedIndices,
+      ...remainingIndices.slice(slot),
+    ];
+    const activeId = pageIds[pageIndex];
+    void applyPageOrder(
+      order,
+      activeId,
+      [...selectedIds],
+      `Moved ${selectedIds.length} selected page${selectedIds.length === 1 ? "" : "s"} together.`,
+    );
+  }, [applyPageOrder, busy, pageIds, pageIndex]);
+
+  const duplicateSelectedPages = useCallback((selectedIds: readonly string[]) => {
+    if (busy || selectedIds.length === 0) return;
+    if (pageIds.length + selectedIds.length > 1_000) {
+      setStatus("Could not duplicate those pages because the working PDF would exceed the 1,000-page safety limit.");
+      return;
+    }
+    const selected = new Set(selectedIds);
+    const order: number[] = [];
+    pageIds.forEach((pageId, index) => {
+      order.push(index);
+      if (selected.has(pageId)) order.push(index);
+    });
+    void applyPageOrder(
+      order,
+      pageIds[pageIndex],
+      [...selectedIds],
+      `Duplicated ${selectedIds.length} selected page${selectedIds.length === 1 ? "" : "s"}.`,
+    );
+  }, [applyPageOrder, busy, pageIds, pageIndex]);
+
+  const restoreStructure = useCallback(async (direction: "undo" | "redo") => {
+    const current = engineRef.current;
+    const source = direction === "undo" ? structureUndoStack : structureRedoStack;
+    const target = source.at(-1);
+    if (!current || !target || busy) return;
+    setBusy(true);
+    const label = direction === "undo" ? "Undoing the last page change…" : "Redoing the page change…";
+    const handle = beginOperation(label);
+    setStatus(label);
+    try {
+      const present = await captureDocumentSnapshot(current, handle);
+      const restored = await current.restoreSnapshot(target.bytes, handle.options);
+      setEngine(restored);
+      engineRef.current = restored;
+      current.close();
+      setEdits(cloneEdits(target.edits));
+      setPageIds([...target.pageIds]);
+      setSelectedPageIds(target.selectedPageIds.filter((id) => target.pageIds.includes(id)));
+      const restoredIndex = target.pageIds.indexOf(target.activePageId);
+      setPageIndex(restoredIndex >= 0 ? restoredIndex : 0);
+      setZoom(1);
+      setFileName(target.fileName);
+      setFileSize(target.fileSize);
+      setDirty(target.dirty);
+      setUndoStack([]);
+      setRedoStack([]);
+      if (direction === "undo") {
+        setStructureUndoStack((history) => history.slice(0, -1));
+        setStructureRedoStack((history) => pushBoundedHistory(history, present));
+      } else {
+        setStructureRedoStack((history) => history.slice(0, -1));
+        setStructureUndoStack((history) => pushBoundedHistory(history, present));
+      }
+      setStatus(`${direction === "undo" ? "Undid" : "Redid"} the page change. Crop and rotation values were restored with each page.`);
+    } catch (error) {
+      setStatus(isAbortError(error)
+        ? `${direction === "undo" ? "Undo" : "Redo"} cancelled; the current PDF is unchanged.`
+        : `Could not ${direction} the page change: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+      endOperation(handle);
+    }
+  }, [beginOperation, busy, captureDocumentSnapshot, endOperation, structureRedoStack, structureUndoStack]);
+
+  const undoStructure = useCallback(() => void restoreStructure("undo"), [restoreStructure]);
+  const redoStructure = useCallback(() => void restoreStructure("redo"), [restoreStructure]);
+
   const toggleSelectedPage = useCallback((pageId: string) => {
     setSelectedPageIds((current) =>
       current.includes(pageId)
@@ -883,7 +1288,7 @@ export function App() {
       .filter((position) => position > 0);
     const shown = positions.slice(0, 8).join(", ");
     const pageList = positions.length > 8 ? `${shown}, and ${positions.length - 8} more` : shown;
-    if (!window.confirm(`Remove page${count === 1 ? "" : "s"} ${pageList} from this working copy? This cannot be undone in this session, and crop or rotation edits on those pages will be lost. Your original PDFs will not be changed.`)) return;
+    if (!window.confirm(`Remove page${count === 1 ? "" : "s"} ${pageList} from this working copy? You can undo this page change while this tab stays open. Your original PDF will not be changed.`)) return;
     const order = pageIds
       .map((_, index) => index)
       .filter((index) => !selected.has(pageIds[index]));
@@ -909,9 +1314,10 @@ export function App() {
       .filter((index) => index >= 0);
     if (!pageOrder.length) return;
     setBusy(true);
+    const handle = beginOperation(`Extracting ${pageOrder.length} selected page${pageOrder.length === 1 ? "" : "s"} locally…`);
     setStatus(`Extracting ${pageOrder.length} selected page${pageOrder.length === 1 ? "" : "s"} locally…`);
     try {
-      const bytes = await current.exportPdf(edits, pageOrder);
+      const bytes = await current.exportPdf(edits, pageOrder, handle.options);
       const baseName = fileName.replace(/\.pdf$/i, "") || "document";
       const contiguous = pageOrder.every((value, index) => index === 0 || value === pageOrder[index - 1] + 1);
       const suffix = contiguous
@@ -921,28 +1327,123 @@ export function App() {
       downloadPdfBytes(bytes, downloadName);
       setStatus(`Download requested for ${downloadName}. The working PDF and unsaved edits were not changed; retry if your browser did not start the download.`);
     } catch (error) {
-      setStatus(`Could not extract the selected pages: ${error instanceof Error ? error.message : String(error)}`);
+      setStatus(isAbortError(error)
+        ? "Selected-page export cancelled. The working PDF is unchanged."
+        : `Could not extract the selected pages: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setBusy(false);
+      endOperation(handle);
     }
-  }, [busy, edits, fileName, pageIds, selectedPageIds]);
+  }, [beginOperation, busy, edits, endOperation, fileName, pageIds, selectedPageIds]);
+
+  const splitPdf = useCallback(async (request: SplitRequest) => {
+    const current = engineRef.current;
+    if (!current || busy) return;
+    const result = buildSplitPlan(request, current.pageInfos.length);
+    if (!result.ok) {
+      setStatus(result.error);
+      return;
+    }
+    const { groups } = result.plan;
+    if (groups.length > 200 && !window.confirm(
+      `This will create ${groups.length} separate PDFs in one ZIP and may use substantial memory. Continue?`,
+    )) return;
+
+    setBusy(true);
+    const handle = beginOperation(`Preparing ${groups.length} split PDF${groups.length === 1 ? "" : "s"}…`);
+    setStatus(`Preparing ${groups.length} split PDF${groups.length === 1 ? "" : "s"} locally…`);
+    try {
+      const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+      const splitOutputLimit = splitOutputLimitBytes(deviceMemory);
+      const splitOutputLimitMb = bytesToWholeMebibytes(splitOutputLimit);
+      const rawBaseName = fileName.replace(/\.pdf$/i, "") || "document";
+      const safeBaseName = rawBaseName.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-");
+      const entries: Array<{ name: string; data: Uint8Array<ArrayBuffer> }> = [];
+      const suffixCounts = new Map<string, number>();
+      let outputBytes = 0;
+
+      for (const [groupIndex, group] of groups.entries()) {
+        if (handle.controller.signal.aborted) {
+          throw new DOMException("The PDF operation was cancelled.", "AbortError");
+        }
+        const partNumber = groupIndex + 1;
+        updateOperation(
+          handle,
+          `Creating ${group.label} (${partNumber} of ${groups.length})…`,
+          groupIndex,
+          groups.length + 1,
+        );
+        const bytes = await current.exportPdf(edits, group.pageIndices, {
+          signal: handle.controller.signal,
+          onProgress: (progress) => {
+            const fraction = progress.total > 0 ? progress.completed / progress.total : 0;
+            updateOperation(
+              handle,
+              `Creating ${group.label} (${partNumber} of ${groups.length})…`,
+              groupIndex + fraction,
+              groups.length + 1,
+            );
+          },
+        });
+        outputBytes += bytes.byteLength;
+        if (outputBytes > splitOutputLimit) {
+          throw new Error(
+            `The split output exceeded this device's ${splitOutputLimitMb} MB in-memory safety limit. ` +
+            "Create fewer files at once or choose larger page ranges.",
+          );
+        }
+        const seen = suffixCounts.get(group.fileSuffix) ?? 0;
+        suffixCounts.set(group.fileSuffix, seen + 1);
+        const uniqueSuffix = seen === 0 ? group.fileSuffix : `${group.fileSuffix}-${seen + 1}`;
+        entries.push({ name: `${safeBaseName}-${uniqueSuffix}.pdf`, data: bytes });
+      }
+
+      updateOperation(handle, "Packaging PDFs into one ZIP…", groups.length, groups.length + 1);
+      const zipBytes = await createStoredZipInWorker(entries, {
+        signal: handle.controller.signal,
+        onProgress: ({ completed, total }) => {
+          const fraction = total > 0 ? completed / total : 0;
+          updateOperation(
+            handle,
+            `Packaging file ${completed} of ${total} into the ZIP…`,
+            groups.length + fraction,
+            groups.length + 1,
+          );
+        },
+      });
+      const downloadName = `${safeBaseName}-split.zip`;
+      downloadZipBytes(zipBytes, downloadName);
+      setStatus(`Download requested for ${downloadName} with ${groups.length} PDF${groups.length === 1 ? "" : "s"}. Your open document is unchanged.`);
+    } catch (error) {
+      setStatus(isAbortError(error)
+        ? "Split export cancelled. Your open document is unchanged."
+        : `Could not split this PDF: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+      endOperation(handle);
+    }
+  }, [beginOperation, busy, edits, endOperation, fileName, updateOperation]);
 
   const downloadPdf = useCallback(async () => {
     if (!engine || busy) return;
     setBusy(true);
+    const handle = beginOperation("Building and verifying your edited PDF…");
     setStatus("Building and verifying your edited PDF…");
     try {
-      const bytes = await engine.exportPdf(edits);
+      const bytes = await engine.exportPdf(edits, undefined, handle.options);
       const baseName = fileName.replace(/\.pdf$/i, "") || "document";
       const downloadName = `${baseName}-edited.pdf`;
       downloadPdfBytes(bytes, downloadName);
       setStatus(`Download requested for ${downloadName}. The original file was not changed or uploaded; retry if your browser did not start the download.`);
     } catch (error) {
-      setStatus(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
+      setStatus(isAbortError(error)
+        ? "Export cancelled. Your working PDF and edits are still here."
+        : `Export failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setBusy(false);
+      endOperation(handle);
     }
-  }, [busy, edits, engine, fileName]);
+  }, [beginOperation, busy, edits, endOperation, engine, fileName]);
 
   useEffect(() => {
     const keyHandler = (event: KeyboardEvent) => {
@@ -1007,7 +1508,7 @@ export function App() {
       onDragEnter={(event) => {
         if (!Array.from(event.dataTransfer.types).includes("Files")) return;
         event.preventDefault();
-        warmPdfEngine();
+        warmPdfWorker();
         if (!busy) setDragActive(true);
       }}
       onDragOver={(event) => {
@@ -1070,9 +1571,9 @@ export function App() {
           type="button"
           className="open-button"
           aria-label={engine ? "Open another PDF" : "Open PDF"}
-          onPointerEnter={warmPdfEngine}
-          onFocus={warmPdfEngine}
-          onTouchStart={warmPdfEngine}
+          onPointerEnter={warmPdfWorker}
+          onFocus={warmPdfWorker}
+          onTouchStart={warmPdfWorker}
           onClick={chooseFile}
           disabled={busy}
         >
@@ -1084,7 +1585,7 @@ export function App() {
           ref={organizerButtonRef}
           type="button"
           className="organize-button"
-          aria-label="Organize, merge, or extract PDF pages"
+          aria-label="Organize, merge, split, or extract PDF pages"
           onClick={openOrganizer}
           disabled={!engine || busy}
         >
@@ -1114,6 +1615,23 @@ export function App() {
         </button>
 
         <div className="header-actions">
+          <div className="pwa-actions" aria-label="App availability">
+            {!pwa.online && (
+              <span className="offline-badge" title="The app is running without a network connection">
+                <WifiOff size={15} /> Offline
+              </span>
+            )}
+            {pwa.canInstall && (
+              <button type="button" className="pwa-button" onClick={() => void installApp()} disabled={busy}>
+                <MonitorDown size={16} /> <span>Install app</span>
+              </button>
+            )}
+            {pwa.updateAvailable && (
+              <button type="button" className="pwa-button is-update" onClick={() => void applyAppUpdate()} disabled={busy}>
+                <RefreshCw size={16} /> <span>Update ready</span>
+              </button>
+            )}
+          </div>
           <button type="button" className="icon-button" aria-label="Undo" disabled={!undoStack.length || busy} onClick={undo}>
             <Undo2 size={18} />
           </button>
@@ -1132,6 +1650,29 @@ export function App() {
           </button>
         </div>
       </header>
+
+      {operation && (
+        <section className="operation-banner" aria-label="PDF operation progress">
+          <span className="operation-spinner" aria-hidden="true" />
+          <div className="operation-copy">
+            <strong>{operation.message}</strong>
+            <span>Working locally in this browser — your document is not being uploaded.</span>
+          </div>
+          <progress
+            aria-label={operation.message}
+            max={operation.total > 0 ? operation.total : undefined}
+            value={operation.total > 0 ? Math.min(operation.completed, operation.total) : undefined}
+          />
+          <button
+            type="button"
+            className="operation-cancel"
+            onClick={cancelOperation}
+            disabled={operation.message.startsWith("Cancelling")}
+          >
+            <CircleStop size={17} /> Cancel
+          </button>
+        </section>
+      )}
 
       {engine && currentPage && currentEdit ? (
         <main className="workspace">
@@ -1204,13 +1745,13 @@ export function App() {
             <div className="empty-icon"><UploadCloud size={30} /></div>
             <span className="eyebrow">No uploads. No account.</span>
             <h1>Crop, rotate, and organize PDFs,<br />privately in your browser.</h1>
-            <p>Crop, rotate, merge, reorder, extract, and batch-edit PDF pages locally with a live preview. No file upload, account, or server-side document storage.</p>
+            <p>Crop, rotate, split, merge, reorder, duplicate, extract, and batch-edit PDF pages locally with a live preview. No file upload, account, or server-side document storage.</p>
             <button
               type="button"
               className="primary-hero-button"
-              onPointerEnter={warmPdfEngine}
-              onFocus={warmPdfEngine}
-              onTouchStart={warmPdfEngine}
+              onPointerEnter={warmPdfWorker}
+              onFocus={warmPdfWorker}
+              onTouchStart={warmPdfWorker}
               onClick={chooseFile}
               disabled={busy}
             >
@@ -1227,8 +1768,8 @@ export function App() {
           </div>
           <div className="feature-strip" aria-label="Main features">
             <span><Sparkles size={16} /> Live precision crop</span>
-            <span><Files size={16} /> Merge &amp; organize pages</span>
-            <span><ShieldCheck size={16} /> No document upload</span>
+            <span><Files size={16} /> Merge, split &amp; organize</span>
+            <span><ShieldCheck size={16} /> Local &amp; offline-ready</span>
           </div>
         </main>
       )}
@@ -1237,6 +1778,7 @@ export function App() {
         <span className={`status-dot ${busy ? "is-busy" : ""}`} aria-hidden="true" />
         <span className="status-message" role="status" aria-live="polite">{status}</span>
         <span className="signature-note">Crop is not redaction · edits invalidate signatures.</span>
+        {pwa.offlineReady && <span className="offline-ready-note">App ready offline</span>}
         <button type="button" className="status-link" onClick={openPrivacy}><ShieldCheck size={15} /> Privacy</button>
         <a href={sourceUrl} target="_blank" rel="noreferrer"><Github size={15} /> Source</a>
       </footer>
@@ -1258,7 +1800,7 @@ export function App() {
           activePage={pageIndex}
           selectedPageIds={selectedPageIdSet}
           busy={busy}
-          status={status}
+          status={operation?.message ?? status}
           addButtonRef={organizerAddButtonRef}
           onClose={closeOrganizer}
           onActivate={(index) => {
@@ -1267,9 +1809,18 @@ export function App() {
             setStatus(`Selected page ${index + 1} for editing.`);
           }}
           onToggleSelected={toggleSelectedPage}
+          onReplaceSelection={setSelectedPageIds}
           onSelectAll={() => setSelectedPageIds([...pageIds])}
           onClearSelection={() => setSelectedPageIds([])}
           onMove={movePage}
+          onMoveSelected={moveSelectedPages}
+          onDuplicateSelected={duplicateSelectedPages}
+          onSplit={(request) => void splitPdf(request)}
+          canUndoStructure={structureUndoStack.length > 0}
+          canRedoStructure={structureRedoStack.length > 0}
+          onUndoStructure={undoStructure}
+          onRedoStructure={redoStructure}
+          onCancelOperation={operation ? cancelOperation : undefined}
           onAddPdf={chooseAddedFiles}
           onExtract={() => void extractSelectedPages()}
           onDelete={deleteSelectedPages}
@@ -1332,9 +1883,17 @@ export function App() {
             <ul>
               <li>No document uploads, accounts, or analytics</li>
               <li>Non-destructive CropBox editing</li>
-              <li>Local PDF merging, reordering, removal, and extraction</li>
+              <li>Local PDF merging, splitting, duplication, reordering, removal, and extraction</li>
+              <li>Installable app shell for offline use after the first visit</li>
               <li>AGPL-3.0-or-later licensed</li>
             </ul>
+            {pwa.canInstall && (
+              <button className="primary-button full-button" type="button" onClick={() => void installApp()}>
+                <MonitorDown size={17} /> Install this app
+              </button>
+            )}
+            {pwa.manualInstallHint && <p className="install-hint">On iPhone or iPad, tap Share, then <strong>Add to Home Screen</strong>.</p>}
+            {pwa.registrationError && <p className="install-hint">Offline setup is unavailable in this browser. The website still works while connected.</p>}
             <p className="legal-copy">You keep ownership of documents you open and outputs you create. Copyright © 2026 CropRotate PDF contributors. This program comes with no warranty.</p>
             <div className="about-links">
               <a className="primary-button full-button link-button" href={sourceUrl} target="_blank" rel="noreferrer"><Github size={17} /> Corresponding source</a>
@@ -1363,10 +1922,10 @@ export function App() {
             <ul className="privacy-list">
               <li>PDF bytes, previews, passwords, page organization, edits, and undo history remain in this tab's memory during the working session.</li>
               <li>The app uses no cookies, local storage, browser database, analytics, or server database to store your documents or editing data.</li>
-              <li>Only choosing <strong>Save local copy</strong> or <strong>Extract selected</strong> requests an output download through your browser.</li>
+              <li>Only choosing <strong>Save local copy</strong>, <strong>Extract selected</strong>, or <strong>Split to ZIP</strong> requests an output download through your browser.</li>
               <li>Cropping changes the PDF's visible page box; it is not redaction and does not erase hidden content outside the crop.</li>
               <li>The app is not a malware scanner or PDF sanitizer; active content and attachments may remain in exported files.</li>
-              <li>GitHub Pages receives ordinary web-request metadata, and your browser may cache the app's static code. Your selected PDFs are not included in those requests.</li>
+              <li>GitHub Pages receives ordinary web-request metadata. For offline use, the service worker caches only the app's static code—not your PDFs, previews, edits, passwords, or output files.</li>
               <li>Browser extensions, operating-system memory handling, and cloud-synced download folders are outside this app's control.</li>
             </ul>
             <p className="ownership-copy"><strong>You keep control of your documents.</strong> This app does not claim ownership of files you open or outputs you create.</p>
